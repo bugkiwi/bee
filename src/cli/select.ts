@@ -1,11 +1,15 @@
 import chalk from "chalk";
+import * as rl from "node:readline";
 
 /**
  * Inline arrow-key selection menu.
  *
- * Works while readline is paused (iface.pause() was called):
- * reads stdin in non-flowing mode via the 'readable' event so
- * readline's data listener never fires and there is no conflict.
+ * Uses the `keypress` event (emitted by rl.emitKeypressEvents) so it works
+ * correctly alongside readline's keypress transform, which consumes raw bytes
+ * before any `readable` listener can see them.
+ *
+ * Explicitly resumes stdin during selection (iface.pause() pauses it) and
+ * pauses it again on exit so readline can resume normally.
  *
  * Returns the chosen index, or null if the user pressed Escape / Ctrl+C.
  */
@@ -33,59 +37,52 @@ export async function interactiveSelect(
     }
   }
 
+  // Ensure keypress events are available (idempotent call).
+  rl.emitKeypressEvents(process.stdin);
+
+  // Enable raw mode so keys arrive individually without waiting for Enter.
+  // readline typically sets this already; guard to avoid errors on non-TTY pipes.
+  if (process.stdin.isTTY && !process.stdin.isRaw) {
+    process.stdin.setRawMode(true);
+  }
+
+  // iface.pause() pauses stdin — resume it so keypress events fire.
+  process.stdin.resume();
+
   // Draw initial menu
   process.stdout.write("\n");
   render(true);
 
   return new Promise<number | null>((resolve) => {
-    let buf = "";
+    let done = false;
 
-    function onReadable() {
-      let chunk: Buffer | string | null;
-      // eslint-disable-next-line no-cond-assign
-      while ((chunk = process.stdin.read() as Buffer | string | null) !== null) {
-        buf += typeof chunk === "string" ? chunk : chunk.toString("utf8");
-        processBuffer();
-      }
-    }
+    function onKeypress(
+      _char: string | undefined,
+      key: { name?: string; ctrl?: boolean; sequence?: string } | undefined
+    ) {
+      if (done || !key) return;
 
-    function processBuffer() {
-      while (buf.length > 0) {
-        if (buf.startsWith("\x1b[A") || buf.startsWith("\x1bOA")) {
-          // Up arrow
-          buf = buf.slice(buf.startsWith("\x1b[A") ? 3 : 3);
-          idx = (idx - 1 + options.length) % options.length;
-          render();
-        } else if (buf.startsWith("\x1b[B") || buf.startsWith("\x1bOB")) {
-          // Down arrow
-          buf = buf.slice(3);
-          idx = (idx + 1) % options.length;
-          render();
-        } else if (buf[0] === "\r" || buf[0] === "\n") {
-          // Enter
-          buf = buf.slice(1);
-          cleanup(idx);
-          return;
-        } else if (buf[0] === "\x1b" && buf.length < 3) {
-          // Incomplete escape — wait for more data
-          break;
-        } else if (buf[0] === "\x1b") {
-          // Escape alone or unknown sequence → cancel
-          cleanup(null);
-          return;
-        } else if (buf[0] === "\x03" || buf[0] === "\x04") {
-          // Ctrl+C / Ctrl+D → cancel
-          cleanup(null);
-          return;
-        } else {
-          // Ignore any other char
-          buf = buf.slice(1);
-        }
+      if (key.name === "up") {
+        idx = (idx - 1 + options.length) % options.length;
+        render();
+      } else if (key.name === "down") {
+        idx = (idx + 1) % options.length;
+        render();
+      } else if (key.name === "return" || key.name === "enter") {
+        cleanup(idx);
+      } else if (key.name === "escape") {
+        cleanup(null);
+      } else if (key.ctrl && (key.name === "c" || key.name === "d")) {
+        cleanup(null);
       }
     }
 
     function cleanup(result: number | null) {
-      process.stdin.removeListener("readable", onReadable);
+      if (done) return;
+      done = true;
+      process.stdin.removeListener("keypress", onKeypress);
+      // Pause stdin again — repl.ts will resume it via iface.resume().
+      process.stdin.pause();
       // Erase the menu lines
       process.stdout.write(`\x1b[${LINES}A`);
       for (let i = 0; i < LINES; i++) process.stdout.write("\x1b[2K\n");
@@ -93,8 +90,6 @@ export async function interactiveSelect(
       resolve(result);
     }
 
-    process.stdin.on("readable", onReadable);
-    // Kick off in case data is already buffered
-    onReadable();
+    process.stdin.on("keypress", onKeypress);
   });
 }
