@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "bee-dev",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["--watch", "src/main.ts"],
+      "port": 3000
+    },
+    {
+      "name": "bee-test-watch",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["test", "--watch"],
+      "port": 3001
+    }
+  ]
+}
