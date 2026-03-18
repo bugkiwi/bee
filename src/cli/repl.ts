@@ -97,15 +97,6 @@ export async function runRepl(
   const PROMPT = "🐝" + chalk.gray(" › ");
   iface.setPrompt(PROMPT);
 
-  // Draw a dim gray border line above the prompt so the input area stands out
-  function showPrompt(): void {
-    if (process.stdout.isTTY) {
-      const width = Math.min(process.stdout.columns ?? 80, 120);
-      process.stdout.write(chalk.dim("─".repeat(width)) + "\n");
-    }
-    iface.prompt();
-  }
-
   const chatSession = new ChatSession(config);
   // image placeholder → resolved file path (populated async after clipboard save)
   const imageMap = new Map<string, string>();
@@ -137,6 +128,73 @@ export async function runRepl(
     _imageHintShown = false;
   }
 
+  // ── Border flag + status line ──────────────────────────────────────────────
+  let _borderShown = false;
+
+  let _statusShown = false;
+
+  function clearStatusLine(): void {
+    if (!_statusShown || !process.stdout.isTTY) return;
+    process.stdout.write("\n\x1b[2K");
+    process.stdout.write("\x1b[1A");
+    const line: string = (iface as unknown as { line: string }).line ?? "";
+    process.stdout.write(`\x1b[${PROMPT_VISIBLE + line.length + 1}G`);
+    _statusShown = false;
+  }
+
+  function showStatusLine(): void {
+    if (!process.stdout.isTTY || _statusShown) return;
+    const provider = chalk.cyan(config.provider);
+    const model = chalk.dim(config.model ?? "default");
+    const msgs = chatSession.messageCount;
+    const msgsStr = msgs > 0 ? chalk.dim(` · ${msgs} msg${msgs !== 1 ? "s" : ""}`) : "";
+    const content = `  ${provider} · ${model}${msgsStr}`;
+    process.stdout.write("\n\x1b[2K" + chalk.dim(content));
+    process.stdout.write("\x1b[1A");
+    const line: string = (iface as unknown as { line: string }).line ?? "";
+    process.stdout.write(`\x1b[${PROMPT_VISIBLE + line.length + 1}G`);
+    _statusShown = true;
+  }
+
+  // Draw a dim gray border line above the prompt so the input area stands out
+  function showPrompt(): void {
+    if (process.stdout.isTTY) {
+      const width = Math.min(process.stdout.columns ?? 80, 120);
+      process.stdout.write(chalk.dim("─".repeat(width)) + "\n");
+      _borderShown = true;
+    }
+    iface.prompt();
+    showStatusLine();
+  }
+
+  // ── Bracketed paste: prevent newlines in pasted text from auto-submitting ──
+  if (process.stdout.isTTY) {
+    process.stdout.write("\x1b[?2004h"); // enable bracketed paste mode
+    let _pasteMode = false;
+    let _pasteBuf = "";
+    const _origEmit = process.stdin.emit.bind(process.stdin);
+    (process.stdin as unknown as { emit: typeof process.stdin.emit }).emit = function (
+      event: string | symbol,
+      ...args: unknown[]
+    ): boolean {
+      if (event === "data") {
+        const chunk = args[0] as Buffer;
+        const str = chunk.toString("utf8");
+        if (str.includes("\x1b[200~") || _pasteMode) {
+          if (!_pasteMode) { _pasteMode = true; _pasteBuf = ""; }
+          _pasteBuf += str.replace("\x1b[200~", "");
+          if (_pasteBuf.includes("\x1b[201~")) {
+            const normalized = _pasteBuf.replace("\x1b[201~", "").replace(/[\r\n]+/g, " ").trimEnd();
+            _pasteMode = false; _pasteBuf = "";
+            return (_origEmit as Function)(event, Buffer.from(normalized, "utf8"));
+          }
+          return true; // swallow raw paste chunks
+        }
+      }
+      return (_origEmit as Function)(event, ...args);
+    } as typeof process.stdin.emit;
+  }
+
   // ── Keypress: suggestions + image hint + Ctrl+V paste ────────────────────
   if (process.stdout.isTTY) {
     rl.emitKeypressEvents(process.stdin);
@@ -144,6 +202,7 @@ export async function runRepl(
     // prependListener fires BEFORE readline's own handler
     process.stdin.prependListener("keypress", (_char, key) => {
       clearSuggestions();
+      clearStatusLine();
 
       // Ctrl+V with a pending clipboard image → insert placeholder
       if (key?.ctrl && key?.name === "v" && _pendingClipImage) {
@@ -173,6 +232,8 @@ export async function runRepl(
         const line: string = (iface as unknown as { line: string }).line ?? "";
         if (line.startsWith("/") && line.length <= 20) {
           showSuggestions(line);
+        } else {
+          showStatusLine(); // show status when not typing slash command
         }
       });
     });
@@ -212,6 +273,7 @@ export async function runRepl(
     clearSuggestions();
     clearImageHint();
     if (_clipPoller) clearInterval(_clipPoller);
+    if (process.stdout.isTTY) process.stdout.write("\x1b[?2004l"); // disable bracketed paste
     console.log(chalk.gray("\nBye.\n"));
     process.exit(0);
   });
@@ -219,7 +281,17 @@ export async function runRepl(
   // ── Line handler ─────────────────────────────────────────────────────────
   iface.on("line", async (raw) => {
     clearSuggestions();
+    clearStatusLine();
     clearImageHint();
+
+    // Erase the border from scrollback — it should only frame the active input
+    if (_borderShown && process.stdout.isTTY) {
+      process.stdout.write("\x1b[2A"); // up past input line + border line
+      process.stdout.write("\x1b[2K"); // erase border
+      process.stdout.write("\x1b[2B"); // back down
+      _borderShown = false;
+    }
+
     const input = raw.trim();
 
     if (!input) {

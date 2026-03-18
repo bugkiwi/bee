@@ -1,6 +1,38 @@
 import chalk from "chalk";
 import type { WorkspaceConfig } from "../types/config.ts";
 
+// ─── Content block types ──────────────────────────────────────────────────────
+
+interface ContentBlock {
+  type: string;
+  text?: string;
+  thinking?: string;
+  name?: string;
+  input?: Record<string, unknown>;
+}
+
+// ─── Auth error detection ─────────────────────────────────────────────────────
+
+function detectAuthError(stderr: string, provider: string): string | null {
+  const s = stderr.toLowerCase();
+  if (provider === "claude") {
+    if (s.includes("not authenticated") || s.includes("login") || s.includes("auth")) {
+      return `  Claude not authenticated. Run: ${chalk.cyan("claude auth login")}`;
+    }
+  }
+  if (provider === "codex") {
+    if (s.includes("api key") || s.includes("openai_api_key") || s.includes("unauthorized")) {
+      return `  Set your API key: ${chalk.cyan("export OPENAI_API_KEY=sk-...")}`;
+    }
+  }
+  if (provider === "kimi") {
+    if (s.includes("api key") || s.includes("moonshot") || s.includes("unauthorized")) {
+      return `  Set your API key: ${chalk.cyan("export MOONSHOT_API_KEY=...")}`;
+    }
+  }
+  return null;
+}
+
 export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
@@ -84,40 +116,52 @@ export class ChatSession {
     const stopSpinner = startSpinner("thinking…");
 
     const proc = Bun.spawn(
-      ["claude", "--print", "--model", model, prompt],
+      ["claude", "--print", "--output-format", "json", "--model", model, prompt],
       { stdout: "pipe", stderr: "pipe" }
     );
 
-    const reader = proc.stdout.getReader();
-    const decoder = new TextDecoder();
-    let fullText = "";
-    let firstChunk = true;
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        if (!chunk) continue;
-        if (firstChunk) {
-          stopSpinner();
-          firstChunk = false;
-        }
-        process.stdout.write(chunk);
-        fullText += chunk;
-      }
-    } finally {
-      reader.releaseLock();
-      stopSpinner();
-    }
-
+    // Collect all stdout (JSON lines mode — no streaming)
+    const rawOut = await new Response(proc.stdout).text().catch(() => "");
     await proc.exited;
 
-    // If nothing came from stdout, check stderr for error
-    if (!fullText.trim()) {
-      const errText = await new Response(proc.stderr).text().catch(() => "");
-      if (errText.trim()) {
-        console.error(chalk.red(`\n  ${errText.trim()}`));
+    // Read stderr for auth/error detection
+    const stderrText = await new Response(proc.stderr).text().catch(() => "");
+
+    stopSpinner();
+
+    const authErr = detectAuthError(stderrText, "claude");
+    if (authErr) throw new Error(authErr);
+    if (proc.exitCode !== 0 && stderrText.trim()) throw new Error(stderrText.trim());
+
+    // Parse and display JSON lines
+    let fullText = "";
+    for (const line of rawOut.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let event: { type?: string; message?: { content?: ContentBlock[] }; result?: string };
+      try {
+        event = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+
+      if (event.type === "assistant" && Array.isArray(event.message?.content)) {
+        for (const block of event.message.content) {
+          if (block.type === "text" && block.text) {
+            process.stdout.write(block.text);
+            fullText += block.text;
+          } else if (block.type === "tool_use") {
+            process.stdout.write(
+              chalk.dim(`\n  🔧 ${chalk.cyan(block.name ?? "")}  ${chalk.gray(JSON.stringify(block.input ?? {}).slice(0, 100))}\n`)
+            );
+          } else if (block.type === "thinking") {
+            process.stdout.write(
+              chalk.dim(`\n  💭 ${chalk.dim(block.thinking?.slice(0, 120) ?? "thinking...")}\n`)
+            );
+          }
+        }
+      } else if (event.type === "result" && event.result) {
+        if (!fullText.trim()) fullText = event.result;
       }
     }
 
@@ -137,6 +181,11 @@ export class ChatSession {
     const text = await new Response(proc.stdout).text();
     stopSpinner();
     await proc.exited;
+
+    const stderrText = await new Response(proc.stderr).text().catch(() => "");
+    const authErr = detectAuthError(stderrText, "codex");
+    if (authErr) throw new Error(authErr);
+    if (proc.exitCode !== 0 && stderrText.trim()) throw new Error(stderrText.trim());
 
     const trimmed = text.trim();
     if (trimmed) process.stdout.write(trimmed);
@@ -175,6 +224,12 @@ export class ChatSession {
     }
 
     await proc.exited;
+
+    const stderrText = await new Response(proc.stderr).text().catch(() => "");
+    const authErr = detectAuthError(stderrText, "kimi");
+    if (authErr) throw new Error(authErr);
+    if (proc.exitCode !== 0 && stderrText.trim()) throw new Error(stderrText.trim());
+
     return fullText.trim();
   }
 
