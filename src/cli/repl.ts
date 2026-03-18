@@ -12,7 +12,7 @@ import { printTaskTable, colorStatus } from "./output.ts";
 import { showRtkGain } from "../plugins/rtk.ts";
 import { runPlan } from "./commands/plan.ts";
 import { runReplay } from "./commands/replay.ts";
-import { showBeeIntro, BEE_ICON } from "./bee.ts";
+import { BEE_ICON } from "./bee.ts";
 import { resolveCommand, SLASH_COMMANDS } from "./commands.ts";
 import { clearSuggestions, showSuggestions } from "./suggestions.ts";
 import { interactiveSelect } from "./select.ts";
@@ -21,6 +21,7 @@ import { ChatSession } from "./chat.ts";
 import { readJsonLines, listFiles, writeJsonFile } from "../utils/fs.ts";
 import type { TraceEvent } from "../types/observability.ts";
 import { join } from "node:path";
+
 
 // ─── Banner ───────────────────────────────────────────────────────────────────
 
@@ -80,6 +81,92 @@ function printHelp(): void {
   console.log(chalk.gray("  Type any message to chat · Tab autocompletes · Ctrl+D or /exit to quit\n"));
 }
 
+// ─── Session summary ──────────────────────────────────────────────────────────
+
+const TOOL_EMOJI_MAP: Record<string, string> = {
+  Read: "📖", Write: "✍️", Edit: "✏️", Bash: "🖥️",
+  Glob: "🔍", Grep: "🔍", WebFetch: "🌐", WebSearch: "🌐",
+  Agent: "🤖", TodoWrite: "📋", NotebookEdit: "📓",
+};
+
+function formatDuration(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  if (m < 60) return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return remM > 0 ? `${h}h ${remM}m` : `${h}h`;
+}
+
+function printSessionSummary(chat: ChatSession): void {
+  const s = chat.getSessionStats();
+  if (s.messages === 0 && s.totalTools === 0) {
+    // Nothing happened this session — just say bye quietly
+    console.log(chalk.gray("\nBye.\n"));
+    return;
+  }
+
+  const W = 44; // inner width
+  const border = "─".repeat(W);
+  const line = (left: string, right: string, lv: number, rv: number) => {
+    const gap = W - 2 - lv - rv;
+    return chalk.dim("│") + " " + left + " ".repeat(Math.max(1, gap)) + right + " " + chalk.dim("│");
+  };
+  const full = (content: string, cv: number) => {
+    const pad = " ".repeat(Math.max(0, W - cv));
+    return chalk.dim("│") + content + pad + chalk.dim("│");
+  };
+
+  const dur = formatDuration(s.durationMs);
+  const msgs = `${s.messages} msg${s.messages !== 1 ? "s" : ""}`;
+  const tools = `${s.totalTools} tool${s.totalTools !== 1 ? "s" : ""}`;
+  const lines = s.linesChanged > 0 ? `~${s.linesChanged} lines` : "";
+
+  // Tool breakdown: top tools with emoji + count
+  const topTools = [...s.toolCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([name, count]) => {
+      const em = TOOL_EMOJI_MAP[name] ?? "🔧";
+      return count > 1 ? `${em}×${count}` : em;
+    })
+    .join("  ");
+  const topToolsVisible = topTools.replace(/[\u{1F300}-\u{1FFFF}]/gu, "  ").length;
+
+  const titleText = `  🐝  ${chalk.bold("Session Summary")}`;
+  const titleVisible = 2 + 2 + 2 + "Session Summary".length; // emoji=2wide + spaces
+
+  const row1L = `  ⏱  ${chalk.cyan(dur)}`;
+  const row1R = `💬 ${chalk.cyan(msgs)}  `;
+  const row1Lv = 2 + 3 + dur.length;
+  const row1Rv = 2 + msgs.length + 2;
+
+  const row2L = `  🔧 ${chalk.cyan(tools)}`;
+  const row2Lv = 2 + 2 + tools.length;
+  let row2R = ""; let row2Rv = 0;
+  if (lines) { row2R = `✏️  ${chalk.cyan(lines)}  `; row2Rv = 3 + lines.length + 2; }
+
+  const parts: string[] = [
+    "",
+    chalk.dim(`╭${border}╮`),
+    full(titleText, titleVisible),
+    chalk.dim(`├${border}┤`),
+    line(row1L, row1R, row1Lv, row1Rv),
+    ...(row2R ? [line(row2L, row2R, row2Lv, row2Rv)] : [line(row2L, "", row2Lv, 0)]),
+  ];
+
+  if (topTools) {
+    const toolRow = `  ${topTools}`;
+    parts.push(chalk.dim(`├${border}┤`));
+    parts.push(full(toolRow, 2 + topToolsVisible));
+  }
+
+  parts.push(chalk.dim(`╰${border}╯`), "");
+  console.log(parts.join("\n"));
+}
+
 // ─── Main REPL ────────────────────────────────────────────────────────────────
 
 export async function runRepl(
@@ -87,10 +174,6 @@ export async function runRepl(
   dirs: { tasks: string; state: string; logs: string; config: string },
   iface: rl.Interface
 ): Promise<void> {
-  if (process.stdout.isTTY) {
-    await showBeeIntro();
-  }
-
   process.stdout.write(makeBanner(config.provider, config.use_rtk ?? false));
   await showStatus(dirs);
 
@@ -104,67 +187,60 @@ export async function runRepl(
   let imageSeq = 0;
   let _lastClipSize = 0;
 
-  // ── Image hint display (below prompt line, like suggestions) ────────────
-  const PROMPT_VISIBLE = 5; // "🐝 › " — emoji 2-wide + " › " = 5 cols
-  let _imageHintShown = false;
+  // ── Multi-line input state ────────────────────────────────────────────────
+  const CONT_PROMPT = chalk.dim("  · "); // continuation line prefix
+  let _mlBuffer: string[] = []; // accumulated lines before submission
+  let _altEnterPending = false; // set in prependListener, consumed in "line" handler
   let _pendingClipImage = false; // true when clipboard has a new unseen image
 
-  function showImageHint(): void {
-    if (!process.stdout.isTTY || _imageHintShown) return;
-    const hint = chalk.gray("  Image in clipboard · ctrl+v to paste");
-    process.stdout.write("\n\x1b[2K" + hint);
-    process.stdout.write("\x1b[1A");
-    const line: string = (iface as unknown as { line: string }).line ?? "";
-    process.stdout.write(`\x1b[${PROMPT_VISIBLE + line.length + 1}G`);
-    _imageHintShown = true;
+  // ── Below-area: separator line + status line drawn below the input ─────────
+  let _belowAreaShown = false;
+
+  function clearBelowArea(): void {
+    if (!_belowAreaShown || !process.stdout.isTTY) return;
+    process.stdout.write("\x1b7");           // save cursor (end of input)
+    process.stdout.write("\x1b[1B\x1b[2K"); // down 1 (no scroll), clear separator line
+    process.stdout.write("\x1b[1B\x1b[2K"); // down 1 (no scroll), clear status line
+    process.stdout.write("\x1b8");           // restore cursor to end of input
+    _belowAreaShown = false;
   }
 
-  function clearImageHint(): void {
-    if (!_imageHintShown) return;
-    process.stdout.write("\n\x1b[2K");
-    process.stdout.write("\x1b[1A");
-    const line: string = (iface as unknown as { line: string }).line ?? "";
-    process.stdout.write(`\x1b[${PROMPT_VISIBLE + line.length + 1}G`);
-    _imageHintShown = false;
-  }
+  function showBelowArea(): void {
+    if (!process.stdout.isTTY || _belowAreaShown) return;
+    const width = Math.min(process.stdout.columns ?? 80, 120);
+    const sep = chalk.dim("─".repeat(width));
 
-  // ── Border flag + status line ──────────────────────────────────────────────
-  let _borderShown = false;
-
-  let _statusShown = false;
-
-  function clearStatusLine(): void {
-    if (!_statusShown || !process.stdout.isTTY) return;
-    process.stdout.write("\n\x1b[2K");
-    process.stdout.write("\x1b[1A");
-    const line: string = (iface as unknown as { line: string }).line ?? "";
-    process.stdout.write(`\x1b[${PROMPT_VISIBLE + line.length + 1}G`);
-    _statusShown = false;
-  }
-
-  function showStatusLine(): void {
-    if (!process.stdout.isTTY || _statusShown) return;
-    const provider = chalk.cyan(config.provider);
-    const model = chalk.dim(config.model ?? "default");
-    const msgs = chatSession.messageCount;
-    const msgsStr = msgs > 0 ? chalk.dim(` · ${msgs} msg${msgs !== 1 ? "s" : ""}`) : "";
-    const content = `  ${provider} · ${model}${msgsStr}`;
-    process.stdout.write("\n\x1b[2K" + chalk.dim(content));
-    process.stdout.write("\x1b[1A");
-    const line: string = (iface as unknown as { line: string }).line ?? "";
-    process.stdout.write(`\x1b[${PROMPT_VISIBLE + line.length + 1}G`);
-    _statusShown = true;
-  }
-
-  // Draw a dim gray border line above the prompt so the input area stands out
-  function showPrompt(): void {
-    if (process.stdout.isTTY) {
-      const width = Math.min(process.stdout.columns ?? 80, 120);
-      process.stdout.write(chalk.dim("─".repeat(width)) + "\n");
-      _borderShown = true;
+    let statusContent: string;
+    if (_pendingClipImage) {
+      statusContent = chalk.gray("  Image in clipboard · ctrl+v to paste");
+    } else {
+      const provider = chalk.cyan(config.provider);
+      const model = chalk.dim(config.model ?? "default");
+      const msgs = chatSession.messageCount;
+      const msgsStr = msgs > 0 ? chalk.dim(` · ${msgs} msg${msgs !== 1 ? "s" : ""}`) : "";
+      const mlStr = _mlBuffer.length > 0 ? chalk.dim(` · ↵ ${_mlBuffer.length + 1} lines`) : "";
+      statusContent = `  ${provider} · ${model}${msgsStr}${mlStr}`;
     }
+
+    // Create 2 rows below (scrolling if at bottom), then back up — ensures
+    // rows exist so \x1b[1B never triggers scroll during the actual draw.
+    process.stdout.write("\n\n\x1b[2A");
+    process.stdout.write("\x1b7");                                          // save cursor (end of input)
+    process.stdout.write("\x1b[1B\x1b[2K" + sep);                          // down 1, clear, separator
+    process.stdout.write("\x1b[1B\x1b[2K" + chalk.dim(statusContent));     // down 1, clear, status
+    process.stdout.write("\x1b8");                                          // restore cursor to end of input
+    _belowAreaShown = true;
+  }
+
+  function refreshBelowArea(): void {
+    clearBelowArea();
+    showBelowArea();
+  }
+
+  function showPrompt(): void {
+    iface.setPrompt(PROMPT);
     iface.prompt();
-    showStatusLine();
+    showBelowArea();
   }
 
   // ── Bracketed paste: prevent newlines in pasted text from auto-submitting ──
@@ -199,41 +275,43 @@ export async function runRepl(
   if (process.stdout.isTTY) {
     rl.emitKeypressEvents(process.stdin);
 
-    // prependListener fires BEFORE readline's own handler
+    // prependListener fires BEFORE readline's own handler.
+    // We ONLY handle special key actions here — no cursor movements,
+    // because cursor moves during IME composition corrupt the display.
     process.stdin.prependListener("keypress", (_char, key) => {
-      clearSuggestions();
-      clearStatusLine();
-
       // Ctrl+V with a pending clipboard image → insert placeholder
       if (key?.ctrl && key?.name === "v" && _pendingClipImage) {
-        clearImageHint();
         _pendingClipImage = false;
+        refreshBelowArea();
         imageSeq++;
         const placeholder = `[Image #${imageSeq}]`;
-        // Write placeholder into readline input before readline handles \x16
         iface.write(placeholder);
-        // Save to disk in background
         saveClipboardImage().then((filePath) => {
           if (filePath) imageMap.set(placeholder, filePath);
         });
         return;
       }
 
-      // Any non-modifier keypress clears the image hint
-      if (key && !key.ctrl && !key.meta && key.name !== "shift") {
-        clearImageHint();
+      // Alt+Enter → flag as continuation; readline will fire "line" which we intercept
+      if (key?.meta && (key?.name === "return" || key?.name === "enter")) {
+        _altEnterPending = true;
+        return;
       }
     });
 
-    // Show slash suggestions AFTER readline updates rl.line
+    // Show slash suggestions AFTER readline updates rl.line.
+    // All cursor-based clears happen here (setImmediate = after readline echoes
+    // the character), avoiding interference with IME composition.
     process.stdin.on("keypress", (_char, key) => {
       if (!key || key.ctrl || key.name === "return" || key.name === "enter") return;
       setImmediate(() => {
         const line: string = (iface as unknown as { line: string }).line ?? "";
         if (line.startsWith("/") && line.length <= 20) {
+          clearBelowArea(); // remove below-area before showing suggestions
           showSuggestions(line);
         } else {
-          showStatusLine(); // show status when not typing slash command
+          clearSuggestions(); // remove suggestions before showing below-area
+          refreshBelowArea();
         }
       });
     });
@@ -252,11 +330,11 @@ export async function runRepl(
       if (size > 0 && size !== _lastClipSize) {
         _lastClipSize = size;
         _pendingClipImage = true;
-        showImageHint();
+        refreshBelowArea();
       } else if (size === 0 && _pendingClipImage) {
         // Clipboard was cleared
         _pendingClipImage = false;
-        clearImageHint();
+        refreshBelowArea();
       }
     }, 600);
   }
@@ -271,28 +349,36 @@ export async function runRepl(
   // ── Ctrl+D / EOF ─────────────────────────────────────────────────────────
   iface.on("close", () => {
     clearSuggestions();
-    clearImageHint();
+    clearBelowArea();
     if (_clipPoller) clearInterval(_clipPoller);
     if (process.stdout.isTTY) process.stdout.write("\x1b[?2004l"); // disable bracketed paste
-    console.log(chalk.gray("\nBye.\n"));
+    printSessionSummary(chatSession);
     process.exit(0);
   });
 
   // ── Line handler ─────────────────────────────────────────────────────────
   iface.on("line", async (raw) => {
     clearSuggestions();
-    clearStatusLine();
-    clearImageHint();
+    clearBelowArea();
 
-    // Erase the border from scrollback — it should only frame the active input
-    if (_borderShown && process.stdout.isTTY) {
-      process.stdout.write("\x1b[2A"); // up past input line + border line
-      process.stdout.write("\x1b[2K"); // erase border
-      process.stdout.write("\x1b[2B"); // back down
-      _borderShown = false;
+    // Alt+Enter → accumulate this line and show continuation prompt
+    if (_altEnterPending) {
+      _altEnterPending = false;
+      _mlBuffer.push(raw);
+      iface.setPrompt(CONT_PROMPT);
+      iface.prompt();
+      showBelowArea();
+      return;
     }
 
-    const input = raw.trim();
+    // Join multi-line buffer with current line
+    let fullInput = raw;
+    if (_mlBuffer.length > 0) {
+      fullInput = [..._mlBuffer, raw].join("\n");
+      _mlBuffer = [];
+    }
+
+    const input = fullInput.trim();
 
     if (!input) {
       showPrompt();
@@ -670,7 +756,8 @@ async function handleCommand(
       break;
 
     case "exit":
-      console.log(chalk.gray("\nBye.\n"));
+      if (chat) printSessionSummary(chat);
+      else console.log(chalk.gray("\nBye.\n"));
       return true;
 
     default:
