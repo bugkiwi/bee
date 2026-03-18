@@ -114,55 +114,90 @@ export class ChatSession {
     const model = this.config.model ?? "claude-sonnet-4-6";
 
     const stopSpinner = startSpinner("thinking…");
+    let spinnerStopped = false;
 
+    // Mirror ClaudeProvider edit-mode: prompt via stdin, stream-json events,
+    // --dangerously-skip-permissions so Claude can use file-editing tools.
     const proc = Bun.spawn(
-      ["claude", "--print", "--output-format", "json", "--model", model, prompt],
-      { stdout: "pipe", stderr: "pipe" }
+      ["claude", "--dangerously-skip-permissions", "--model", model, "--output-format", "stream-json"],
+      { stdin: new Blob([prompt]), stdout: "pipe", stderr: "pipe" }
     );
 
-    // Collect all stdout (JSON lines mode — no streaming)
-    const rawOut = await new Response(proc.stdout).text().catch(() => "");
+    // Drain stderr concurrently to prevent buffer deadlock
+    const stderrProm = new Response(proc.stderr).text().catch(() => "");
+
+    const reader = proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    let fullText = "";
+    let buf = "";
+
+    function stopOnce() {
+      if (!spinnerStopped) { stopSpinner(); spinnerStopped = true; }
+    }
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        // Process every complete newline-delimited JSON line
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          let ev: {
+            type?: string;
+            message?: { content?: ContentBlock[] };
+            result?: string;
+            name?: string;
+            input?: Record<string, unknown>;
+          };
+          try { ev = JSON.parse(trimmed); } catch { continue; }
+
+          if (ev.type === "system") continue; // skip init handshake
+          stopOnce();
+
+          if (ev.type === "assistant" && Array.isArray(ev.message?.content)) {
+            for (const block of ev.message!.content!) {
+              if (block.type === "text" && block.text) {
+                process.stdout.write(block.text);
+                fullText += block.text;
+              } else if (block.type === "tool_use") {
+                process.stdout.write(
+                  chalk.dim(`\n  🔧 ${chalk.cyan(block.name ?? "")}  ${chalk.gray(JSON.stringify(block.input ?? {}).slice(0, 120))}\n`)
+                );
+              } else if (block.type === "thinking") {
+                process.stdout.write(
+                  chalk.dim(`\n  💭 ${(block.thinking ?? "").slice(0, 200)}\n`)
+                );
+              }
+            }
+          } else if (ev.type === "tool_use") {
+            // Top-level tool_use event (emitted between assistant turns)
+            process.stdout.write(
+              chalk.dim(`\n  🔧 ${chalk.cyan(ev.name ?? "")}  ${chalk.gray(JSON.stringify(ev.input ?? {}).slice(0, 120))}\n`)
+            );
+          } else if (ev.type === "result" && ev.result && !fullText.trim()) {
+            process.stdout.write(ev.result);
+            fullText = ev.result;
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+      stopOnce();
+    }
+
     await proc.exited;
-
-    // Read stderr for auth/error detection
-    const stderrText = await new Response(proc.stderr).text().catch(() => "");
-
-    stopSpinner();
+    const stderrText = await stderrProm;
 
     const authErr = detectAuthError(stderrText, "claude");
     if (authErr) throw new Error(authErr);
-    if (proc.exitCode !== 0 && stderrText.trim()) throw new Error(stderrText.trim());
-
-    // Parse and display JSON lines
-    let fullText = "";
-    for (const line of rawOut.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      let event: { type?: string; message?: { content?: ContentBlock[] }; result?: string };
-      try {
-        event = JSON.parse(trimmed);
-      } catch {
-        continue;
-      }
-
-      if (event.type === "assistant" && Array.isArray(event.message?.content)) {
-        for (const block of event.message.content) {
-          if (block.type === "text" && block.text) {
-            process.stdout.write(block.text);
-            fullText += block.text;
-          } else if (block.type === "tool_use") {
-            process.stdout.write(
-              chalk.dim(`\n  🔧 ${chalk.cyan(block.name ?? "")}  ${chalk.gray(JSON.stringify(block.input ?? {}).slice(0, 100))}\n`)
-            );
-          } else if (block.type === "thinking") {
-            process.stdout.write(
-              chalk.dim(`\n  💭 ${chalk.dim(block.thinking?.slice(0, 120) ?? "thinking...")}\n`)
-            );
-          }
-        }
-      } else if (event.type === "result" && event.result) {
-        if (!fullText.trim()) fullText = event.result;
-      }
+    if (proc.exitCode !== 0 && stderrText.trim() && !fullText.trim()) {
+      throw new Error(stderrText.trim());
     }
 
     return fullText.trim();
