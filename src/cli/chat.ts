@@ -167,6 +167,11 @@ export interface SessionStats {
   linesChanged: number;
 }
 
+export interface ChatOptions {
+  /** Called with a message when the session starts working, null when done. */
+  onStatusUpdate?: (message: string | null) => void;
+}
+
 export class ChatSession {
   private history: ChatMessage[] = [];
   private sessionStart = Date.now();
@@ -174,7 +179,7 @@ export class ChatSession {
   private toolCounts = new Map<string, number>();
   private linesChanged = 0;
 
-  constructor(private config: WorkspaceConfig) {}
+  constructor(private config: WorkspaceConfig, private opts: ChatOptions = {}) {}
 
   get messageCount(): number {
     return this.history.length;
@@ -208,7 +213,7 @@ export class ChatSession {
    */
   async send(userMessage: string): Promise<void> {
     this.history.push({ role: "user", content: userMessage });
-
+    this.opts.onStatusUpdate?.("thinking…");
     console.log(); // blank line before response
 
     let reply: string | null = null;
@@ -231,6 +236,8 @@ export class ChatSession {
       console.error(chalk.red(`  Error: ${String(err)}\n`));
       this.history.pop(); // remove failed user message
       return;
+    } finally {
+      this.opts.onStatusUpdate?.(null);
     }
 
     if (reply !== null) {

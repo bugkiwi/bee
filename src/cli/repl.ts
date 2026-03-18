@@ -18,6 +18,8 @@ import { clearSuggestions, showSuggestions } from "./suggestions.ts";
 import { interactiveSelect } from "./select.ts";
 import { ensureScreenshotDir, saveClipboardImage, clipboardImageSize } from "./screenshot.ts";
 import { ChatSession } from "./chat.ts";
+import { StatusLine, STATUS_PRIORITY } from "./statusline.ts";
+import { ReplLayout } from "./layout.ts";
 import { readJsonLines, listFiles, writeJsonFile } from "../utils/fs.ts";
 import type { TraceEvent } from "../types/observability.ts";
 import { join } from "node:path";
@@ -180,7 +182,19 @@ export async function runRepl(
   const PROMPT = "🐝" + chalk.gray(" › ");
   iface.setPrompt(PROMPT);
 
-  const chatSession = new ChatSession(config);
+  const status = new StatusLine();
+  const layout = new ReplLayout(status);
+
+  const chatSession = new ChatSession(config, {
+    onStatusUpdate: (msg) => {
+      if (msg === null) {
+        status.clear(STATUS_PRIORITY.WORKING);
+      } else {
+        status.set(STATUS_PRIORITY.WORKING, msg);
+      }
+      layout.refreshStatus();
+    },
+  });
   // image placeholder → resolved file path (populated async after clipboard save)
   const imageMap = new Map<string, string>();
   let _clipPoller: ReturnType<typeof setInterval> | undefined;
@@ -193,57 +207,106 @@ export async function runRepl(
   let _altEnterPending = false; // set in prependListener, consumed in "line" handler
   let _pendingClipImage = false; // true when clipboard has a new unseen image
 
-  // ── Below-area: separator line + status line drawn below the input ─────────
-  let _belowAreaShown = false;
+  // ── Ctrl+C / Ctrl+D double-press state ───────────────────────────────────
+  // First press: if line has content → clears it; if empty → no-op.
+  // Either way, marks _ctrlExitPending = true.
+  // Second press (while pending): closes the interface (exit).
+  // Any other keypress resets the pending flag.
+  let _ctrlExitPending = false;
 
-  function clearBelowArea(): void {
-    if (!_belowAreaShown || !process.stdout.isTTY) return;
-    process.stdout.write("\x1b7");           // save cursor (end of input)
-    process.stdout.write("\x1b[1B\x1b[2K"); // down 1 (no scroll), clear separator line
-    process.stdout.write("\x1b[1B\x1b[2K"); // down 1 (no scroll), clear status line
-    process.stdout.write("\x1b8");           // restore cursor to end of input
-    _belowAreaShown = false;
+  // ── History navigation state ──────────────────────────────────────────────
+  // readline stores submitted lines in (iface as any).history[], index 0 = newest.
+  // _histIdx = -1 means not browsing; ≥0 means browsing at that index.
+  // _histSavedLine preserves the user's in-progress text before entering history.
+  // _upPressedOnce: first ↑ on non-empty input moves cursor to start;
+  //                 second ↑ (while _upPressedOnce) enters history.
+  let _histIdx = -1;
+  let _histSavedLine = "";
+  let _upPressedOnce = false;
+
+  // ── Low-level line helpers ────────────────────────────────────────────────
+  const getLine = (): string =>
+    (iface as unknown as { line: string }).line ?? "";
+  const getHistory = (): string[] =>
+    (iface as unknown as { history: string[] }).history ?? [];
+
+  /** Replace the entire readline input with `text` (cursor ends at rightmost position). */
+  function setLine(text: string): void {
+    iface.write(null, { ctrl: true, name: "a" }); // cursor → start
+    iface.write(null, { ctrl: true, name: "k" }); // kill → end
+    if (text) iface.write(text);
   }
 
-  function showBelowArea(): void {
-    if (!process.stdout.isTTY || _belowAreaShown) return;
-    const width = Math.min(process.stdout.columns ?? 80, 120);
-    const sep = chalk.dim("─".repeat(width));
-
-    let statusContent: string;
-    if (_pendingClipImage) {
-      statusContent = chalk.gray("  Image in clipboard · ctrl+v to paste");
+  function handleHistoryUp(): void {
+    const line = getLine();
+    const history = getHistory();
+    if (_histIdx === -1) {
+      if (line && !_upPressedOnce) {
+        // First ↑ on non-empty: jump cursor to start, arm the flag
+        iface.write(null, { ctrl: true, name: "a" });
+        _upPressedOnce = true;
+        return;
+      }
+      // Second ↑ (armed) or empty input: enter history mode
+      if (history.length === 0) { _upPressedOnce = false; return; }
+      _histSavedLine = line;
+      _histIdx = 0;
+      _upPressedOnce = false;
+      setLine(history[0]!);
     } else {
-      const provider = chalk.cyan(config.provider);
-      const model = chalk.dim(config.model ?? "default");
-      const msgs = chatSession.messageCount;
-      const msgsStr = msgs > 0 ? chalk.dim(` · ${msgs} msg${msgs !== 1 ? "s" : ""}`) : "";
-      const mlStr = _mlBuffer.length > 0 ? chalk.dim(` · ↵ ${_mlBuffer.length + 1} lines`) : "";
-      statusContent = `  ${provider} · ${model}${msgsStr}${mlStr}`;
+      // Already browsing: go to older entry (higher index)
+      _upPressedOnce = false;
+      if (_histIdx < history.length - 1) {
+        _histIdx++;
+        setLine(history[_histIdx]!);
+      }
+      // At oldest entry: stay, don't wrap
+    }
+  }
+
+  function handleHistoryDown(): void {
+    _upPressedOnce = false;
+    if (_histIdx === -1) return; // not in history, ↓ does nothing
+    if (_histIdx > 0) {
+      _histIdx--;
+      setLine(getHistory()[_histIdx]!);
+    } else {
+      // Past most recent: restore original in-progress input
+      const saved = _histSavedLine;
+      _histIdx = -1;
+      _histSavedLine = "";
+      setLine(saved);
+    }
+  }
+
+  // ── Prompt with status header ─────────────────────────────────────────────
+  // Status lives in the fixed bottom row managed by ReplLayout.
+  // showPrompt() just refreshes that row and calls iface.prompt().
+  // No static text is written above the prompt, so readline's cursor tracking
+  // is never disturbed and the prompt naturally follows content down the screen.
+  function showPrompt(): void {
+    const provider = chalk.cyan(config.provider);
+    const model = chalk.dim(config.model ?? "default");
+    const msgs = chatSession.messageCount;
+    const msgsStr = msgs > 0 ? chalk.dim(` · ${msgs} msg${msgs !== 1 ? "s" : ""}`) : "";
+    const mlStr = _mlBuffer.length > 0 ? chalk.dim(` · ${_mlBuffer.length + 1} lines`) : "";
+    status.set(STATUS_PRIORITY.BASE, `${provider} · ${model}${msgsStr}${mlStr}`);
+
+    if (_pendingClipImage) {
+      status.set(STATUS_PRIORITY.CLIPBOARD, "📋 Image in clipboard · Ctrl+V to paste");
+    } else {
+      status.clear(STATUS_PRIORITY.CLIPBOARD);
     }
 
-    // Create 2 rows below (scrolling if at bottom), then back up — ensures
-    // rows exist so \x1b[1B never triggers scroll during the actual draw.
-    process.stdout.write("\n\n\x1b[2A");
-    process.stdout.write("\x1b7");                                          // save cursor (end of input)
-    process.stdout.write("\x1b[1B\x1b[2K" + sep);                          // down 1, clear, separator
-    process.stdout.write("\x1b[1B\x1b[2K" + chalk.dim(statusContent));     // down 1, clear, status
-    process.stdout.write("\x1b8");                                          // restore cursor to end of input
-    _belowAreaShown = true;
-  }
-
-  function refreshBelowArea(): void {
-    clearBelowArea();
-    showBelowArea();
-  }
-
-  function showPrompt(): void {
+    layout.refreshStatus();
     iface.setPrompt(PROMPT);
     iface.prompt();
-    showBelowArea();
   }
 
-  // ── Bracketed paste: prevent newlines in pasted text from auto-submitting ──
+  // ── stdin data-level interceptor ─────────────────────────────────────────
+  // Handles: Ctrl+C/D double-press exit, ↑/↓ history, bracketed paste.
+  // Operating at the raw "data" level means readline never sees these bytes,
+  // so we have full control without fighting readline's built-in handlers.
   if (process.stdout.isTTY) {
     process.stdout.write("\x1b[?2004h"); // enable bracketed paste mode
     let _pasteMode = false;
@@ -256,6 +319,32 @@ export async function runRepl(
       if (event === "data") {
         const chunk = args[0] as Buffer;
         const str = chunk.toString("utf8");
+
+        // ── Ctrl+C (\x03) and Ctrl+D (\x04): double-press to exit ──────────
+        // First press on empty  → no visible change, arm _ctrlExitPending.
+        // First press with text → clear the line, arm _ctrlExitPending.
+        // Second press (pending) → close (exit REPL).
+        if (str === "\x03" || str === "\x04") {
+          const line = getLine();
+          if (_ctrlExitPending) {
+            iface.close();
+          } else if (line) {
+            setLine(""); // clear content
+            _mlBuffer = [];
+            _histIdx = -1;
+            _histSavedLine = "";
+            _ctrlExitPending = true;
+          } else {
+            _ctrlExitPending = true; // empty line: just arm, no visible change
+          }
+          return true; // always swallow — never let readline handle these
+        }
+
+        // ── Arrow keys: custom history navigation ────────────────────────────
+        if (str === "\x1b[A") { handleHistoryUp();   return true; }
+        if (str === "\x1b[B") { handleHistoryDown(); return true; }
+
+        // ── Bracketed paste ──────────────────────────────────────────────────
         if (str.includes("\x1b[200~") || _pasteMode) {
           if (!_pasteMode) { _pasteMode = true; _pasteBuf = ""; }
           _pasteBuf += str.replace("\x1b[200~", "");
@@ -276,13 +365,11 @@ export async function runRepl(
     rl.emitKeypressEvents(process.stdin);
 
     // prependListener fires BEFORE readline's own handler.
-    // We ONLY handle special key actions here — no cursor movements,
-    // because cursor moves during IME composition corrupt the display.
+    // No cursor movements here — IME composition is sensitive to them.
     process.stdin.prependListener("keypress", (_char, key) => {
       // Ctrl+V with a pending clipboard image → insert placeholder
       if (key?.ctrl && key?.name === "v" && _pendingClipImage) {
         _pendingClipImage = false;
-        refreshBelowArea();
         imageSeq++;
         const placeholder = `[Image #${imageSeq}]`;
         iface.write(placeholder);
@@ -291,7 +378,6 @@ export async function runRepl(
         });
         return;
       }
-
       // Alt+Enter → flag as continuation; readline will fire "line" which we intercept
       if (key?.meta && (key?.name === "return" || key?.name === "enter")) {
         _altEnterPending = true;
@@ -299,19 +385,29 @@ export async function runRepl(
       }
     });
 
-    // Show slash suggestions AFTER readline updates rl.line.
-    // All cursor-based clears happen here (setImmediate = after readline echoes
-    // the character), avoiding interference with IME composition.
+    // Show slash suggestions AFTER readline updates rl.line (setImmediate = after
+    // readline echoes the char, so IME composition is not disturbed).
+    // Also: reset pending-exit and up-pressed flags on any regular keypress.
     process.stdin.on("keypress", (_char, key) => {
       if (!key || key.ctrl || key.name === "return" || key.name === "enter") return;
       setImmediate(() => {
-        const line: string = (iface as unknown as { line: string }).line ?? "";
+        // Any regular keypress cancels the double-press pending state
+        _ctrlExitPending = false;
+        // Any non-arrow keypress cancels the "cursor moved to start" arm
+        _upPressedOnce = false;
+        // If the user edited while in history mode, exit history mode
+        if (_histIdx >= 0) {
+          const hist = getHistory();
+          if (getLine() !== (hist[_histIdx] ?? "")) {
+            _histIdx = -1;
+            _histSavedLine = "";
+          }
+        }
+        const line = getLine();
         if (line.startsWith("/") && line.length <= 20) {
-          clearBelowArea(); // remove below-area before showing suggestions
           showSuggestions(line);
         } else {
-          clearSuggestions(); // remove suggestions before showing below-area
-          refreshBelowArea();
+          clearSuggestions();
         }
       });
     });
@@ -330,28 +426,24 @@ export async function runRepl(
       if (size > 0 && size !== _lastClipSize) {
         _lastClipSize = size;
         _pendingClipImage = true;
-        refreshBelowArea();
+        // Status will show the hint on next showPrompt()
+        // (updating status display during active readline input is avoided
+        //  to prevent cursor corruption)
       } else if (size === 0 && _pendingClipImage) {
-        // Clipboard was cleared
         _pendingClipImage = false;
-        refreshBelowArea();
       }
     }, 600);
   }
 
-  // ── Ctrl+C ───────────────────────────────────────────────────────────────
-  iface.on("SIGINT", () => {
-    clearSuggestions();
-    console.log(chalk.gray("\n(use /exit or Ctrl+D to quit)\n"));
-    showPrompt();
-  });
-
   // ── Ctrl+D / EOF ─────────────────────────────────────────────────────────
+  // Note: Ctrl+C (\x03) and Ctrl+D (\x04) are now fully handled in the
+  // stdin data interceptor above. SIGINT will only fire for programmatic
+  // signals (external kill -INT), handled here as a safe fallback.
   iface.on("close", () => {
     clearSuggestions();
-    clearBelowArea();
     if (_clipPoller) clearInterval(_clipPoller);
     if (process.stdout.isTTY) process.stdout.write("\x1b[?2004l"); // disable bracketed paste
+    layout.cleanup(); // reset DECSTBM so the shell is clean after exit
     printSessionSummary(chatSession);
     process.exit(0);
   });
@@ -359,7 +451,11 @@ export async function runRepl(
   // ── Line handler ─────────────────────────────────────────────────────────
   iface.on("line", async (raw) => {
     clearSuggestions();
-    clearBelowArea();
+    // Submitting a line resets all interaction state
+    _ctrlExitPending = false;
+    _histIdx = -1;
+    _histSavedLine = "";
+    _upPressedOnce = false;
 
     // Alt+Enter → accumulate this line and show continuation prompt
     if (_altEnterPending) {
@@ -367,7 +463,6 @@ export async function runRepl(
       _mlBuffer.push(raw);
       iface.setPrompt(CONT_PROMPT);
       iface.prompt();
-      showBelowArea();
       return;
     }
 
@@ -383,6 +478,16 @@ export async function runRepl(
     if (!input) {
       showPrompt();
       return;
+    }
+
+    // Rewrite the readline-echoed prompt line as a styled history entry.
+    // readline already wrote: "🐝 › <input>\n" and moved to the next line.
+    // We go back one line, clear it, and replace with a clean gray "› message".
+    if (process.stdout.isTTY) {
+      const display = fullInput.includes("\n")
+        ? (fullInput.split("\n")[0] ?? "") + " ···"
+        : input;
+      process.stdout.write(`\x1b[A\x1b[2K${chalk.dim("  › " + display)}\n`);
     }
 
     iface.pause();
@@ -405,7 +510,8 @@ export async function runRepl(
           imageMap.delete(placeholder);
         }
       }
-      // Free-form chat message → send to active provider
+      // Free-form chat — the scroll region keeps status+separator fixed at bottom
+      // while content streams naturally through the scroll area above.
       await chatSession.send(message);
     }
 
@@ -413,6 +519,10 @@ export async function runRepl(
     showPrompt();
   });
 
+  // Activate the permanent scroll-region layout (reserves bottom 2 rows for
+  // separator + status).  Must be called AFTER the banner so the banner goes
+  // to the full-screen area before DECSTBM narrows the scroll region.
+  layout.init();
   showPrompt();
 
   // Wait for close
