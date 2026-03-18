@@ -5,9 +5,7 @@ node_modules/
 dist/
 
 # Runtime state & logs
-state/
 logs/
-tasks/
 
 # Local config
 .bee/

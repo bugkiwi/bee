@@ -6,32 +6,16 @@ export interface ChatMessage {
   content: string;
 }
 
-// ─── Bee bounce spinner ───────────────────────────────────────────────────────
-//
-// 🐝 bounces left → right → left inside a fixed-width track:
-//   [🐝        ] thinking…
-//   [ 🐝       ] thinking…
-//   …
-//   [        🐝] thinking…  ← hits right wall, reverses
-//
-const BOUNCE_TRACK = 10; // total visual columns for the bounce zone
-const BOUNCE_MAX   = BOUNCE_TRACK - 2; // 🐝 is 2-wide, so max left-edge pos = 8
-
-function beeFrame(pos: number, label: string): string {
-  const before = " ".repeat(pos);
-  const after  = " ".repeat(BOUNCE_MAX - pos);
-  return `\r  ${chalk.dim("[")}${before}${chalk.yellow("🐝")}${after}${chalk.dim("]")} ${chalk.gray(label)}`;
-}
+// ─── In-place emoji spinner ───────────────────────────────────────────────────
+// Cycles through frames in-place with \r, no movement track.
+const SPIN_FRAMES = ["🐝", "🌸", "🍯", "🐝"];
 
 function startSpinner(label: string): () => void {
   if (!process.stdout.isTTY) return () => {};
-  let pos = 0;
-  let dir = 1;
+  let i = 0;
   const t = setInterval(() => {
-    process.stdout.write(beeFrame(pos, label));
-    pos += dir;
-    if (pos >= BOUNCE_MAX || pos <= 0) dir = -dir;
-  }, 60);
+    process.stdout.write(`\r  ${SPIN_FRAMES[i++ % SPIN_FRAMES.length]} ${chalk.gray(label)}`);
+  }, 500);
   return () => {
     clearInterval(t);
     process.stdout.write("\r\x1b[2K");

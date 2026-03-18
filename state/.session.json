@@ -1,0 +1,78 @@
+{
+  "session_id": "8aa1727e-f848-450f-8459-ecfbdc9a2342",
+  "started_at": "2026-03-18T04:16:38.675Z",
+  "active_provider": "claude",
+  "shared_context": "",
+  "providers": {
+    "claude": {
+      "provider": "claude",
+      "tokens_used": 0,
+      "cost_usd": 0,
+      "last_active": "2026-03-18T04:16:38.675Z"
+    },
+    "codex": {
+      "provider": "codex",
+      "tokens_used": 0,
+      "cost_usd": 0,
+      "last_active": "2026-03-18T04:16:38.676Z"
+    }
+  },
+  "limit_events": [
+    {
+      "provider": "claude",
+      "kind": "rate_limit",
+      "message": "manual switch",
+      "timestamp": "2026-03-18T04:16:38.676Z",
+      "switched_to": "codex"
+    },
+    {
+      "provider": "codex",
+      "kind": "rate_limit",
+      "message": "manual switch",
+      "timestamp": "2026-03-18T04:16:45.753Z",
+      "switched_to": "claude"
+    },
+    {
+      "provider": "claude",
+      "kind": "rate_limit",
+      "message": "manual switch",
+      "timestamp": "2026-03-18T04:16:54.235Z",
+      "switched_to": "codex"
+    },
+    {
+      "provider": "codex",
+      "kind": "rate_limit",
+      "message": "manual switch",
+      "timestamp": "2026-03-18T05:56:07.320Z",
+      "switched_to": "claude"
+    },
+    {
+      "provider": "claude",
+      "kind": "rate_limit",
+      "message": "manual switch",
+      "timestamp": "2026-03-18T05:56:11.103Z",
+      "switched_to": "codex"
+    },
+    {
+      "provider": "codex",
+      "kind": "rate_limit",
+      "message": "manual switch",
+      "timestamp": "2026-03-18T06:38:56.186Z",
+      "switched_to": "claude"
+    },
+    {
+      "provider": "claude",
+      "kind": "rate_limit",
+      "message": "manual switch",
+      "timestamp": "2026-03-18T06:39:00.360Z",
+      "switched_to": "codex"
+    },
+    {
+      "provider": "codex",
+      "kind": "rate_limit",
+      "message": "manual switch",
+      "timestamp": "2026-03-18T06:39:27.480Z",
+      "switched_to": "claude"
+    }
+  ]
+}
