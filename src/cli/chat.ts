@@ -119,7 +119,7 @@ export class ChatSession {
     // Mirror ClaudeProvider edit-mode: prompt via stdin, stream-json events,
     // --dangerously-skip-permissions so Claude can use file-editing tools.
     const proc = Bun.spawn(
-      ["claude", "--dangerously-skip-permissions", "--model", model, "--output-format", "stream-json"],
+      ["claude", "--dangerously-skip-permissions", "--model", model, "--output-format", "stream-json", "--verbose"],
       { stdin: new Blob([prompt]), stdout: "pipe", stderr: "pipe" }
     );
 

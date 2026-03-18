@@ -37,6 +37,7 @@ export class ClaudeProvider extends BaseProvider {
         this.model,
         "--output-format",
         "stream-json",
+        "--verbose",
       ];
     } else {
       baseArgs = [
@@ -44,6 +45,7 @@ export class ClaudeProvider extends BaseProvider {
         "--print",
         "--output-format",
         "stream-json",
+        "--verbose",
         "--dangerously-skip-permissions",
         "--model",
         this.model,
