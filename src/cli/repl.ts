@@ -97,6 +97,15 @@ export async function runRepl(
   const PROMPT = "🐝" + chalk.gray(" › ");
   iface.setPrompt(PROMPT);
 
+  // Draw a dim gray border line above the prompt so the input area stands out
+  function showPrompt(): void {
+    if (process.stdout.isTTY) {
+      const width = Math.min(process.stdout.columns ?? 80, 120);
+      process.stdout.write(chalk.dim("─".repeat(width)) + "\n");
+    }
+    iface.prompt();
+  }
+
   const chatSession = new ChatSession(config);
   // image placeholder → resolved file path (populated async after clipboard save)
   const imageMap = new Map<string, string>();
@@ -195,7 +204,7 @@ export async function runRepl(
   iface.on("SIGINT", () => {
     clearSuggestions();
     console.log(chalk.gray("\n(use /exit or Ctrl+D to quit)\n"));
-    iface.prompt();
+    showPrompt();
   });
 
   // ── Ctrl+D / EOF ─────────────────────────────────────────────────────────
@@ -214,7 +223,7 @@ export async function runRepl(
     const input = raw.trim();
 
     if (!input) {
-      iface.prompt();
+      showPrompt();
       return;
     }
 
@@ -243,10 +252,10 @@ export async function runRepl(
     }
 
     iface.resume();
-    iface.prompt();
+    showPrompt();
   });
 
-  iface.prompt();
+  showPrompt();
 
   // Wait for close
   await new Promise<void>((resolve) => {
