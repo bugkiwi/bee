@@ -1,8 +1,8 @@
 import chalk from "chalk";
 import { SLASH_COMMANDS } from "./commands.ts";
 
-// Visible length of the prompt "bee › " (no ANSI codes)
-const PROMPT_VISIBLE = 6; // "bee › "
+// Visible columns of the prompt "🐝 › " — emoji is 2-wide + " › " = 5
+const PROMPT_VISIBLE = 5; // "🐝 › "
 const MAX_SUGGESTIONS = 10; // cap to avoid excessive scrolling
 
 let _lineCount = 0; // suggestion lines currently on screen
@@ -39,12 +39,16 @@ export function showSuggestions(partial: string): void {
   clearSuggestions();
 
   const query = partial.startsWith("/") ? partial.slice(1) : "";
-  const matches = SLASH_COMMANDS.filter(
-    (c) =>
-      !query ||
-      c.name.startsWith(query) ||
-      (c.alias ?? "").startsWith(query)
-  );
+  // Exact alias match wins — e.g. "/p" → only `provider`, not also `plan`
+  const exactAlias = query ? SLASH_COMMANDS.find((c) => c.alias === query) : null;
+  const matches = exactAlias
+    ? [exactAlias]
+    : SLASH_COMMANDS.filter(
+        (c) =>
+          !query ||
+          c.name.startsWith(query) ||
+          (c.alias ?? "").startsWith(query)
+      );
   if (matches.length === 0) return;
 
   const rows = matches.slice(0, MAX_SUGGESTIONS).map((c) => {

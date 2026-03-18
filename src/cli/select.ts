@@ -32,7 +32,8 @@ export async function interactiveSelect(
     for (let i = 0; i < options.length; i++) {
       const active = i === idx;
       const cursor = active ? chalk.cyan("❯") : " ";
-      const label  = active ? chalk.bold.white(options[i]!) : chalk.gray(options[i]!);
+      // Non-active items: no chalk wrapper so embedded colors (e.g. green "(active)") show through
+      const label  = active ? chalk.bold.white(options[i]!) : options[i]!;
       process.stdout.write(`\x1b[2K  ${cursor} ${label}\n`);
     }
   }
@@ -83,10 +84,11 @@ export async function interactiveSelect(
       process.stdin.removeListener("keypress", onKeypress);
       // Pause stdin again — repl.ts will resume it via iface.resume().
       process.stdin.pause();
-      // Erase the menu lines
-      process.stdout.write(`\x1b[${LINES}A`);
-      for (let i = 0; i < LINES; i++) process.stdout.write("\x1b[2K\n");
-      process.stdout.write(`\x1b[${LINES}A`);
+      // Erase menu lines + the leading blank line written before render(true)
+      const TOTAL = LINES + 1;
+      process.stdout.write(`\x1b[${TOTAL}A`);
+      for (let i = 0; i < TOTAL; i++) process.stdout.write("\x1b[2K\n");
+      process.stdout.write(`\x1b[${TOTAL}A`);
       resolve(result);
     }
 

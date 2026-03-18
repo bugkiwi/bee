@@ -94,7 +94,7 @@ export async function runRepl(
   process.stdout.write(makeBanner(config.provider, config.use_rtk ?? false));
   await showStatus(dirs);
 
-  const PROMPT = chalk.bold.cyan("bee") + chalk.gray(" › ");
+  const PROMPT = "🐝" + chalk.gray(" › ");
   iface.setPrompt(PROMPT);
 
   const chatSession = new ChatSession(config);
@@ -105,7 +105,7 @@ export async function runRepl(
   let _lastClipSize = 0;
 
   // ── Image hint display (below prompt line, like suggestions) ────────────
-  const PROMPT_VISIBLE = 6; // "bee › "
+  const PROMPT_VISIBLE = 5; // "🐝 › " — emoji 2-wide + " › " = 5 cols
   let _imageHintShown = false;
   let _pendingClipImage = false; // true when clipboard has a new unseen image
 
