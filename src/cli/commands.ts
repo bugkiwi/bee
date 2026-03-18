@@ -26,7 +26,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   },
   {
     name: "plan",
-    alias: "p",
+    alias: "pl",
     desc: "Generate a task from a spec file",
     usage: "/plan <spec-file> [--provider claude|codex|kimi]",
   },
