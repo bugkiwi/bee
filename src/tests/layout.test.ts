@@ -3,7 +3,6 @@ import { StatusLine } from "../cli/statusline.ts";
 import { ReplLayout } from "../cli/layout.ts";
 
 // ─── Fake stdout that captures escape sequences ──────────────────────────────
-// We monkey-patch process.stdout to capture writes without a real TTY.
 
 let captured: string[] = [];
 let origWrite: typeof process.stdout.write;
@@ -20,12 +19,10 @@ function setupFakeStdout(rows = 24, cols = 80): void {
   origCols = process.stdout.columns;
   origOn = process.stdout.on;
 
-  // Fake isTTY, rows, columns
   Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
   Object.defineProperty(process.stdout, "rows", { value: rows, configurable: true });
   Object.defineProperty(process.stdout, "columns", { value: cols, configurable: true });
 
-  // Capture writes instead of sending to terminal
   (process.stdout as unknown as { write: typeof process.stdout.write }).write =
     function (chunk: unknown, ..._rest: unknown[]): boolean {
       if (typeof chunk === "string") {
@@ -36,7 +33,6 @@ function setupFakeStdout(rows = 24, cols = 80): void {
       return true;
     } as typeof process.stdout.write;
 
-  // Stub .on("resize") to avoid real listener leaks
   (process.stdout as unknown as { on: typeof process.stdout.on }).on =
     function (..._args: unknown[]): typeof process.stdout {
       return process.stdout;
@@ -51,12 +47,10 @@ function teardownFakeStdout(): void {
   (process.stdout as unknown as { on: typeof process.stdout.on }).on = origOn;
 }
 
-/** Get all captured output as a single string. */
 function allOutput(): string {
   return captured.join("");
 }
 
-/** Extract all CUP (Cursor Position) sequences like \x1b[R;CH */
 function extractCursorPositions(s: string): Array<{ row: number; col: number }> {
   const re = /\x1b\[(\d+);(\d+)H/g;
   const positions: Array<{ row: number; col: number }> = [];
@@ -67,7 +61,6 @@ function extractCursorPositions(s: string): Array<{ row: number; col: number }> 
   return positions;
 }
 
-/** Check if the string contains a DECSTBM sequence \x1b[T;Br */
 function extractScrollRegion(s: string): { top: number; bottom: number } | null {
   const m = s.match(/\x1b\[(\d+);(\d+)r/);
   if (!m) return null;
@@ -76,13 +69,12 @@ function extractScrollRegion(s: string): { top: number; bottom: number } | null 
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
-describe("ReplLayout: init() cursor positioning", () => {
+describe("ReplLayout: init()", () => {
   beforeEach(() => setupFakeStdout(24, 80));
   afterEach(() => teardownFakeStdout());
 
   it("sets DECSTBM scroll region to 1..rows-3", () => {
-    const status = new StatusLine();
-    const layout = new ReplLayout(status);
+    const layout = new ReplLayout(new StatusLine());
     layout.init();
 
     const region = extractScrollRegion(allOutput());
@@ -91,171 +83,150 @@ describe("ReplLayout: init() cursor positioning", () => {
     expect(region!.bottom).toBe(21); // 24 - 3
   });
 
-  it("last cursor position after init() is row 1, col 1 (top of scroll region)", () => {
-    const status = new StatusLine();
-    const layout = new ReplLayout(status);
+  it("final cursor position is row 1, col 1 (top of scroll region)", () => {
+    const layout = new ReplLayout(new StatusLine());
     layout.init();
 
-    const output = allOutput();
-    const positions = extractCursorPositions(output);
-    // The very last CUP sequence should place cursor at row 1, col 1
+    const positions = extractCursorPositions(allOutput());
     const last = positions[positions.length - 1];
     expect(last).toBeDefined();
     expect(last!.row).toBe(1);
     expect(last!.col).toBe(1);
   });
 
-  it("clears the screen before setting up layout", () => {
-    const status = new StatusLine();
-    const layout = new ReplLayout(status);
+  it("clears the screen", () => {
+    const layout = new ReplLayout(new StatusLine());
     layout.init();
-
-    const output = allOutput();
-    // \x1b[2J = clear entire screen
-    expect(output).toContain("\x1b[2J");
+    expect(allOutput()).toContain("\x1b[2J");
   });
 
-  it("does NOT use DEC save/restore (\\x1b7/\\x1b8) during init", () => {
-    // Save/restore during init is the root cause of the invisible cursor bug:
-    // it restores the cursor to the pre-init position (shell prompt area)
-    // which is in the fixed rows, outside the scroll region.
-    const status = new StatusLine();
-    const layout = new ReplLayout(status);
+  it("saves initial content cursor with SCO save (\\x1b[s)", () => {
+    const layout = new ReplLayout(new StatusLine());
     layout.init();
+    expect(allOutput()).toContain("\x1b[s");
+  });
 
+  it("does NOT use DEC save/restore during init", () => {
+    const layout = new ReplLayout(new StatusLine());
+    layout.init();
     const output = allOutput();
     expect(output).not.toContain("\x1b7");
     expect(output).not.toContain("\x1b8");
   });
 
   it("draws separator at row rows-2 (22)", () => {
-    const status = new StatusLine();
-    const layout = new ReplLayout(status);
+    const layout = new ReplLayout(new StatusLine());
     layout.init();
-
     const positions = extractCursorPositions(allOutput());
-    const hasRow22 = positions.some(p => p.row === 22 && p.col === 1);
-    expect(hasRow22).toBe(true);
+    expect(positions.some(p => p.row === 22 && p.col === 1)).toBe(true);
   });
 
   it("draws prompt area at row rows-1 (23)", () => {
-    const status = new StatusLine();
-    const layout = new ReplLayout(status);
+    const layout = new ReplLayout(new StatusLine());
     layout.init();
-
     const positions = extractCursorPositions(allOutput());
-    const hasRow23 = positions.some(p => p.row === 23 && p.col === 1);
-    expect(hasRow23).toBe(true);
+    expect(positions.some(p => p.row === 23 && p.col === 1)).toBe(true);
   });
 
   it("draws status at row rows (24)", () => {
-    const status = new StatusLine();
-    const layout = new ReplLayout(status);
+    const layout = new ReplLayout(new StatusLine());
     layout.init();
-
     const positions = extractCursorPositions(allOutput());
-    const hasRow24 = positions.some(p => p.row === 24 && p.col === 1);
-    expect(hasRow24).toBe(true);
-  });
-
-  it("contentRow starts at 1 after init", () => {
-    const status = new StatusLine();
-    const layout = new ReplLayout(status);
-    layout.init();
-
-    expect(layout.contentRow).toBe(1);
+    expect(positions.some(p => p.row === 24 && p.col === 1)).toBe(true);
   });
 });
 
-describe("ReplLayout: enterContent() positions cursor correctly", () => {
+describe("ReplLayout: enterContent() uses SCO restore", () => {
   beforeEach(() => setupFakeStdout(24, 80));
   afterEach(() => teardownFakeStdout());
 
-  it("enterContent() moves cursor to contentRow", () => {
-    const status = new StatusLine();
-    const layout = new ReplLayout(status);
+  it("emits SCO restore (\\x1b[u)", () => {
+    const layout = new ReplLayout(new StatusLine());
     layout.init();
-    captured = []; // clear init output
-
-    layout.enterContent();
-    const positions = extractCursorPositions(allOutput());
-    expect(positions).toHaveLength(1);
-    expect(positions[0]!.row).toBe(1); // contentRow starts at 1
-    expect(positions[0]!.col).toBe(1);
-  });
-
-  it("enterContent() after advanceContent(5) moves to row 6", () => {
-    const status = new StatusLine();
-    const layout = new ReplLayout(status);
-    layout.init();
-    layout.advanceContent(5);
     captured = [];
 
     layout.enterContent();
-    const positions = extractCursorPositions(allOutput());
-    expect(positions[0]!.row).toBe(6);
-  });
-
-  it("enterContent() clamps to rows-3 when contentRow exceeds scroll region", () => {
-    const status = new StatusLine();
-    const layout = new ReplLayout(status);
-    layout.init();
-    layout.advanceContent(100); // way past scroll region
-    captured = [];
-
-    layout.enterContent();
-    const positions = extractCursorPositions(allOutput());
-    expect(positions[0]!.row).toBe(21); // rows-3 = 24-3
+    expect(allOutput()).toBe("\x1b[u");
   });
 });
 
-describe("ReplLayout: enterPrompt() positions cursor at fixed prompt row", () => {
+describe("ReplLayout: enterPrompt() saves content cursor and moves to prompt row", () => {
   beforeEach(() => setupFakeStdout(24, 80));
   afterEach(() => teardownFakeStdout());
 
-  it("enterPrompt() moves cursor to rows-1 (23)", () => {
-    const status = new StatusLine();
-    const layout = new ReplLayout(status);
+  it("saves content cursor with SCO save before moving", () => {
+    const layout = new ReplLayout(new StatusLine());
     layout.init();
     captured = [];
 
     layout.enterPrompt();
-    const positions = extractCursorPositions(allOutput());
-    expect(positions[0]!.row).toBe(23);
-    expect(positions[0]!.col).toBe(1);
+    const output = allOutput();
+    // SCO save should come before CUP to prompt row
+    const saveIdx = output.indexOf("\x1b[s");
+    const cupIdx = output.indexOf("\x1b[23;1H");
+    expect(saveIdx).toBeGreaterThanOrEqual(0);
+    expect(cupIdx).toBeGreaterThan(saveIdx);
   });
 
-  it("enterPrompt() clears the prompt line (\\x1b[2K)", () => {
-    const status = new StatusLine();
-    const layout = new ReplLayout(status);
+  it("moves to rows-1 (23) and clears line", () => {
+    const layout = new ReplLayout(new StatusLine());
     layout.init();
     captured = [];
 
     layout.enterPrompt();
-    expect(allOutput()).toContain("\x1b[2K");
+    const output = allOutput();
+    expect(output).toContain("\x1b[23;1H");
+    expect(output).toContain("\x1b[2K");
   });
 });
 
-describe("ReplLayout: refreshStatus() uses save/restore correctly", () => {
+describe("ReplLayout: saveContent()", () => {
   beforeEach(() => setupFakeStdout(24, 80));
   afterEach(() => teardownFakeStdout());
 
-  it("refreshStatus() saves and restores cursor", () => {
+  it("emits SCO save (\\x1b[s)", () => {
+    const layout = new ReplLayout(new StatusLine());
+    layout.init();
+    captured = [];
+
+    layout.saveContent();
+    expect(allOutput()).toBe("\x1b[s");
+  });
+});
+
+describe("ReplLayout: refreshStatus() uses DEC save/restore (independent of SCO)", () => {
+  beforeEach(() => setupFakeStdout(24, 80));
+  afterEach(() => teardownFakeStdout());
+
+  it("uses DEC save (\\x1b7) and restore (\\x1b8)", () => {
     const status = new StatusLine();
-    status.set(0, "test status");
+    status.set(0, "test");
     const layout = new ReplLayout(status);
     layout.init();
     captured = [];
 
     layout.refreshStatus();
     const output = allOutput();
-    expect(output).toContain("\x1b7"); // save
-    expect(output).toContain("\x1b8"); // restore
+    expect(output).toContain("\x1b7");
+    expect(output).toContain("\x1b8");
   });
 
-  it("refreshStatus() writes to row rows (24)", () => {
+  it("does NOT use SCO save/restore", () => {
     const status = new StatusLine();
-    status.set(0, "test status");
+    status.set(0, "test");
+    const layout = new ReplLayout(status);
+    layout.init();
+    captured = [];
+
+    layout.refreshStatus();
+    const output = allOutput();
+    expect(output).not.toContain("\x1b[s");
+    expect(output).not.toContain("\x1b[u");
+  });
+
+  it("writes to row rows (24)", () => {
+    const status = new StatusLine();
+    status.set(0, "test");
     const layout = new ReplLayout(status);
     layout.init();
     captured = [];
@@ -266,52 +237,12 @@ describe("ReplLayout: refreshStatus() uses save/restore correctly", () => {
   });
 });
 
-describe("ReplLayout: advanceContent() clamping", () => {
-  it("advances contentRow by n", () => {
-    setupFakeStdout(24, 80);
-    const status = new StatusLine();
-    const layout = new ReplLayout(status);
-    layout.init();
-
-    layout.advanceContent(3);
-    expect(layout.contentRow).toBe(4); // 1 + 3
-
-    teardownFakeStdout();
-  });
-
-  it("clamps contentRow to rows-3", () => {
-    setupFakeStdout(24, 80);
-    const status = new StatusLine();
-    const layout = new ReplLayout(status);
-    layout.init();
-
-    layout.advanceContent(100);
-    expect(layout.contentRow).toBe(21); // 24 - 3
-
-    teardownFakeStdout();
-  });
-
-  it("multiple advances accumulate", () => {
-    setupFakeStdout(24, 80);
-    const status = new StatusLine();
-    const layout = new ReplLayout(status);
-    layout.init();
-
-    layout.advanceContent(2);
-    layout.advanceContent(3);
-    expect(layout.contentRow).toBe(6); // 1 + 2 + 3
-
-    teardownFakeStdout();
-  });
-});
-
-describe("ReplLayout: cleanup() resets scroll region", () => {
+describe("ReplLayout: cleanup()", () => {
   beforeEach(() => setupFakeStdout(24, 80));
   afterEach(() => teardownFakeStdout());
 
-  it("cleanup() resets DECSTBM to full screen (\\x1b[r)", () => {
-    const status = new StatusLine();
-    const layout = new ReplLayout(status);
+  it("resets DECSTBM to full screen (\\x1b[r)", () => {
+    const layout = new ReplLayout(new StatusLine());
     layout.init();
     captured = [];
 
@@ -322,7 +253,6 @@ describe("ReplLayout: cleanup() resets scroll region", () => {
 
 describe("ReplLayout: non-TTY is a no-op", () => {
   it("init() does nothing when not a TTY", () => {
-    // Don't fake TTY
     const origTTY = process.stdout.isTTY;
     Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
 
@@ -331,12 +261,9 @@ describe("ReplLayout: non-TTY is a no-op", () => {
     (process.stdout as unknown as { write: typeof process.stdout.write }).write =
       function (): boolean { written = true; return true; } as typeof process.stdout.write;
 
-    const status = new StatusLine();
-    const layout = new ReplLayout(status);
+    const layout = new ReplLayout(new StatusLine());
     layout.init();
-
     expect(written).toBe(false);
-    expect(layout.contentRow).toBe(1);
 
     (process.stdout as unknown as { write: typeof process.stdout.write }).write = origW;
     Object.defineProperty(process.stdout, "isTTY", { value: origTTY, configurable: true });
@@ -345,15 +272,47 @@ describe("ReplLayout: non-TTY is a no-op", () => {
 
 describe("ReplLayout: small terminal (rows < 8) is a no-op", () => {
   it("init() does nothing when terminal is too small", () => {
-    setupFakeStdout(6, 80); // too small
-    const status = new StatusLine();
-    const layout = new ReplLayout(status);
+    setupFakeStdout(6, 80);
+    const layout = new ReplLayout(new StatusLine());
     layout.init();
 
-    // No DECSTBM should be set
     expect(allOutput()).not.toContain("r");
     expect(captured).toHaveLength(0);
 
     teardownFakeStdout();
+  });
+});
+
+describe("ReplLayout: SCO vs DEC independence — content cursor survives status refresh", () => {
+  beforeEach(() => setupFakeStdout(24, 80));
+  afterEach(() => teardownFakeStdout());
+
+  it("enterContent → refreshStatus → enterContent restores same position", () => {
+    // This is the critical scenario: during AI streaming, the content cursor
+    // is active.  refreshStatus() fires (via onStatusUpdate).  After refresh,
+    // the content cursor must return to exactly where it was.
+    //
+    // SCO slot = content cursor, DEC slot = status refresh.  They must not
+    // interfere with each other.
+    const status = new StatusLine();
+    status.set(0, "thinking…");
+    const layout = new ReplLayout(status);
+    layout.init();
+
+    // Simulate: enterContent → write something → saveContent
+    layout.enterContent();
+    process.stdout.write("hello\n");
+    layout.saveContent();
+
+    // refreshStatus should NOT corrupt the SCO slot
+    layout.refreshStatus();
+
+    captured = [];
+    // enterContent should restore to the position after "hello\n"
+    layout.enterContent();
+    const output = allOutput();
+    expect(output).toBe("\x1b[u");
+    // The restore goes to the saved position — DEC restore (\x1b8) in
+    // refreshStatus should NOT have affected the SCO slot.
   });
 });

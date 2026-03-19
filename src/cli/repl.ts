@@ -185,12 +185,12 @@ export async function runRepl(
   const layout = new ReplLayout(status);
   layout.init(); // ← reserve bottom 3 rows FIRST
 
-  // Banner + status go into the scroll region; track newlines for content cursor
+  // Banner + status go into the scroll region
   const banner = makeBanner(config.provider, config.use_rtk ?? false);
   process.stdout.write(banner);
-  layout.advanceContent((banner.match(/\n/g) || []).length);
-  const statusNl = await layout.trackWrites(() => showStatus(dirs));
-  layout.advanceContent(statusNl);
+  await showStatus(dirs);
+  // Save content cursor after initial output so enterContent() returns here
+  layout.saveContent();
 
   const PROMPT = "🐝" + chalk.gray(" › ");
   iface.setPrompt(PROMPT);
@@ -209,13 +209,12 @@ export async function runRepl(
     try {
       while (_msgQueue.length > 0) {
         const msg = _msgQueue.shift()!;
-        // Write submitted line + AI response to the content area
+        // Restore content cursor, write submitted line + AI response
         layout.enterContent();
         process.stdout.write(chalk.dim("  › " + msg) + "\n");
-        layout.advanceContent(1);
-        // Track newlines from the AI response for content cursor
-        const nl = await layout.trackWrites(() => chatSession.send(msg));
-        layout.advanceContent(nl);
+        await chatSession.send(msg);
+        // Save content cursor so next enterContent() returns here
+        layout.saveContent();
       }
     } finally {
       _queueBusy = false;
@@ -330,7 +329,9 @@ export async function runRepl(
     const msgs = chatSession.messageCount;
     const msgsStr = msgs > 0 ? chalk.dim(` · ${msgs} msg${msgs !== 1 ? "s" : ""}`) : "";
     const mlStr = _mlBuffer.length > 0 ? chalk.dim(` · ${_mlBuffer.length + 1} lines`) : "";
-    status.set(STATUS_PRIORITY.BASE, `${provider} · ${model}${msgsStr}${mlStr}`);
+    const sid = chatSession.beeSession?.id;
+    const sidStr = sid ? chalk.dim(` · ${sid.slice(0, 8)}`) : "";
+    status.set(STATUS_PRIORITY.BASE, `${provider} · ${model}${sidStr}${msgsStr}${mlStr}`);
 
     if (_pendingClipImage) {
       status.set(STATUS_PRIORITY.CLIPBOARD, "📋 Image in clipboard · Ctrl+V to paste");
@@ -523,31 +524,26 @@ export async function runRepl(
 
     if (input.startsWith("!")) {
       // ── Shell escape: !command runs in the user's shell ──────────────────
-      // Multi-line input (via Alt+Enter) is joined with \n so heredocs etc.
-      // work as expected.
       const shellCmd = fullInput.replace(/^\s*!/, "");
       iface.pause();
       layout.enterContent();
       process.stdout.write(chalk.dim("  ! " + shellCmd) + "\n");
-      layout.advanceContent(1);
       try {
-        const nl = await layout.trackWrites(async () => {
-          const proc = Bun.spawn(["sh", "-c", shellCmd], {
-            stdin: "inherit",
-            stdout: "inherit",
-            stderr: "inherit",
-            cwd: process.cwd(),
-            env: process.env,
-          });
-          await proc.exited;
-          if (proc.exitCode !== 0) {
-            process.stdout.write(chalk.dim(`  exit ${proc.exitCode}\n`));
-          }
+        const proc = Bun.spawn(["sh", "-c", shellCmd], {
+          stdin: "inherit",
+          stdout: "inherit",
+          stderr: "inherit",
+          cwd: process.cwd(),
+          env: process.env,
         });
-        layout.advanceContent(nl);
+        await proc.exited;
+        if (proc.exitCode !== 0) {
+          process.stdout.write(chalk.dim(`  exit ${proc.exitCode}\n`));
+        }
       } catch (err) {
-        console.error(chalk.red(`  Shell error: ${err}`));
+        process.stdout.write(chalk.red(`  Shell error: ${err}\n`));
       }
+      layout.saveContent();
       iface.resume();
       showPrompt();
     } else if (input.startsWith("/")) {
@@ -556,16 +552,12 @@ export async function runRepl(
       layout.enterContent();
       const resolved = resolveCommand(input);
       const [cmd, ...args] = resolved.split(/\s+/);
-      let didExit = false;
-      const nl = await layout.trackWrites(async () => {
-        const shouldExit = await handleCommand(cmd ?? "", args, config, dirs, chatSession);
-        if (shouldExit) {
-          didExit = true;
-          iface.close();
-        }
-      });
-      if (didExit) return;
-      layout.advanceContent(nl);
+      const shouldExit = await handleCommand(cmd ?? "", args, config, dirs, chatSession);
+      if (shouldExit) {
+        iface.close();
+        return;
+      }
+      layout.saveContent();
       iface.resume();
       showPrompt();
     } else {

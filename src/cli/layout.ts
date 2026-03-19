@@ -2,7 +2,7 @@ import chalk from "chalk";
 import type { StatusLine } from "./statusline.ts";
 
 /**
- * ReplLayout — 3-row fixed bottom with content cursor tracking.
+ * ReplLayout — 3-row fixed bottom with cursor save/restore.
  *
  * Terminal layout:
  *
@@ -18,20 +18,20 @@ import type { StatusLine } from "./statusline.ts";
  * DECSTBM keeps bottom 3 rows fixed.  Content streams in the scroll region.
  * The prompt is always at rows-1 — it never scrolls away.
  *
- * The layout tracks _contentRow so it can position the cursor in the scroll
- * region for content writes (submitted lines, AI responses) and return it to
- * the prompt row afterwards.
+ * Cursor tracking uses TWO independent save/restore slots:
+ *   - SCO  (\x1b[s / \x1b[u) — saves/restores the content cursor position
+ *   - DEC  (\x1b7  / \x1b8)  — saves/restores during status-row refresh
+ * This way refreshStatus() can run mid-stream without corrupting the
+ * content cursor, and enterContent()/leaveContent() always returns to
+ * the exact byte where content left off.
  */
 export class ReplLayout {
   private _status: StatusLine;
   private _active = false;
-  private _contentRow = 1;
 
   constructor(status: StatusLine) {
     this._status = status;
   }
-
-  get contentRow(): number { return this._contentRow; }
 
   /**
    * Initialize: set DECSTBM, draw fixed bottom rows.
@@ -49,14 +49,13 @@ export class ReplLayout {
     process.stdout.write(`\x1b[1;${rows - 3}r`);
 
     // Draw fixed rows, then position cursor at top-left of scroll region.
-    // IMPORTANT: do NOT use \x1b7/\x1b8 (DEC save/restore) here — at program
-    // start the saved cursor position is the shell prompt (bottom of screen),
-    // restoring it puts the cursor in the fixed area, making it invisible.
     this._drawFixed(rows, cols);
     process.stdout.write("\x1b[1;1H");
 
+    // Save the initial content cursor position in the SCO slot
+    process.stdout.write("\x1b[s");
+
     this._active = true;
-    this._contentRow = 1;
     process.stdout.on("resize", () => this._onResize());
   }
 
@@ -70,40 +69,40 @@ export class ReplLayout {
   // ── Cursor positioning ───────────────────────────────────────────────────
 
   /**
-   * Move cursor into the content (scroll) area at the tracked content row.
-   * Call before writing content (submitted lines, AI output).
+   * Restore the content cursor position (SCO restore) and continue writing
+   * in the scroll region.  Call before writing content.
    */
   enterContent(): void {
     if (!process.stdout.isTTY) return;
-    const rows = process.stdout.rows ?? 24;
-    const max = rows - 3;
-    if (this._contentRow > max) this._contentRow = max;
-    process.stdout.write(`\x1b[${this._contentRow};1H`);
+    process.stdout.write("\x1b[u");
   }
 
   /**
-   * Move cursor to the prompt row (rows-1) and clear it.
+   * Save the content cursor (SCO save) and move to the prompt row (rows-1).
    * Call before iface.prompt().
    */
   enterPrompt(): void {
     if (!process.stdout.isTTY) return;
     const rows = process.stdout.rows ?? 24;
+    // Save content cursor so enterContent() can return here later
+    process.stdout.write("\x1b[s");
     process.stdout.write(`\x1b[${rows - 1};1H\x1b[2K`);
   }
 
   /**
-   * Advance the content row counter by `n` newlines.
-   * Capped at the bottom of the scroll region (rows-3).
+   * Save the content cursor without leaving the content area.
+   * Call after finishing a batch of content writes (e.g. after AI response)
+   * so the next enterContent() returns to the right spot.
    */
-  advanceContent(n: number): void {
-    const rows = process.stdout.rows ?? 24;
-    const max = rows - 3;
-    this._contentRow = Math.min(this._contentRow + n, max);
+  saveContent(): void {
+    if (!process.stdout.isTTY) return;
+    process.stdout.write("\x1b[s");
   }
 
   /**
    * Update the status row in-place.
-   * Safe to call at any time — cursor is saved/restored.
+   * Safe to call at any time — uses DEC save/restore (\x1b7/\x1b8),
+   * independent of the SCO content cursor slot.
    */
   refreshStatus(): void {
     if (!this._active || !process.stdout.isTTY) return;
@@ -113,35 +112,6 @@ export class ReplLayout {
       `\x1b[${rows};1H\x1b[2K${chalk.dim("  " + this._status.render())}`
     );
     process.stdout.write("\x1b8");
-  }
-
-  /**
-   * Wrap a function so that all process.stdout.write calls during its
-   * execution are counted for content-row tracking.  Returns the number
-   * of newlines written.
-   */
-  async trackWrites(fn: () => Promise<void>): Promise<number> {
-    if (!process.stdout.isTTY) {
-      await fn();
-      return 0;
-    }
-    const origWrite = process.stdout.write.bind(process.stdout);
-    let nlCount = 0;
-    (process.stdout as unknown as { write: typeof process.stdout.write }).write =
-      function (chunk: unknown, ...rest: unknown[]): boolean {
-        if (typeof chunk === "string") {
-          nlCount += (chunk.match(/\n/g) || []).length;
-        } else if (Buffer.isBuffer(chunk)) {
-          nlCount += (chunk.toString().match(/\n/g) || []).length;
-        }
-        return (origWrite as Function)(chunk, ...rest);
-      } as typeof process.stdout.write;
-    try {
-      await fn();
-    } finally {
-      (process.stdout as unknown as { write: typeof process.stdout.write }).write = origWrite;
-    }
-    return nlCount;
   }
 
   // ── Private helpers ────────────────────────────────────────────────────────
@@ -166,12 +136,9 @@ export class ReplLayout {
     const cols = process.stdout.columns ?? 80;
     // Update scroll region for new size
     process.stdout.write(`\x1b[1;${rows - 3}r`);
-    // Redraw fixed rows
+    // Redraw fixed rows using DEC save/restore (won't affect content cursor)
     process.stdout.write("\x1b7");
     this._drawFixed(rows, cols);
     process.stdout.write("\x1b8");
-    // Clamp content row
-    const max = rows - 3;
-    if (this._contentRow > max) this._contentRow = max;
   }
 }
