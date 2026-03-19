@@ -176,21 +176,55 @@ export async function runRepl(
   dirs: { tasks: string; state: string; logs: string; config: string },
   iface: rl.Interface
 ): Promise<void> {
+  // ── Layout MUST be initialised before the banner ───────────────────────────
+  // ReplLayout sets DECSTBM (scroll region = rows 1..rows-2).  If we print
+  // the banner BEFORE setting the scroll region the cursor ends up in the
+  // fixed-row area (separator / status), which causes every subsequent write
+  // (prompt echo, AI response, line-rewrite) to land in the wrong rows and
+  // become invisible or corrupt the fixed rows.
+  const status = new StatusLine();
+  const layout = new ReplLayout(status);
+  layout.init(); // ← reserve bottom 2 rows FIRST
+
   process.stdout.write(makeBanner(config.provider, config.use_rtk ?? false));
   await showStatus(dirs);
 
   const PROMPT = "🐝" + chalk.gray(" › ");
   iface.setPrompt(PROMPT);
 
-  const status = new StatusLine();
-  const layout = new ReplLayout(status);
+  // ── Message queue ──────────────────────────────────────────────────────────
+  // Chat messages are processed sequentially from a queue so readline never
+  // needs to be paused.  This allows the user to submit the next message while
+  // the current response is still streaming — it will be processed immediately
+  // after.
+  const _msgQueue: string[] = [];
+  let _queueBusy = false;
+
+  async function drainQueue(): Promise<void> {
+    if (_queueBusy) return;
+    _queueBusy = true;
+    try {
+      while (_msgQueue.length > 0) {
+        const msg = _msgQueue.shift()!;
+        await chatSession.send(msg);
+      }
+    } finally {
+      _queueBusy = false;
+      // Redraw the prompt so readline's position tracking is correct
+      // after AI output potentially scrolled the terminal.
+      layout.refreshStatus();
+      iface.setPrompt(PROMPT);
+      iface.prompt();
+    }
+  }
 
   const chatSession = new ChatSession(config, {
     onStatusUpdate: (msg) => {
       if (msg === null) {
         status.clear(STATUS_PRIORITY.WORKING);
       } else {
-        status.set(STATUS_PRIORITY.WORKING, msg);
+        const queued = _msgQueue.length > 0 ? chalk.dim(` · +${_msgQueue.length} queued`) : "";
+        status.set(STATUS_PRIORITY.WORKING, `${msg}${queued}`);
       }
       layout.refreshStatus();
     },
@@ -490,10 +524,9 @@ export async function runRepl(
       process.stdout.write(`\x1b[A\x1b[2K${chalk.dim("  › " + display)}\n`);
     }
 
-    iface.pause();
-
     if (input.startsWith("/")) {
-      // Slash command
+      // Slash commands: pause while running so readline doesn't interleave
+      iface.pause();
       const resolved = resolveCommand(input);
       const [cmd, ...args] = resolved.split(/\s+/);
       const shouldExit = await handleCommand(cmd ?? "", args, config, dirs, chatSession);
@@ -501,8 +534,11 @@ export async function runRepl(
         iface.close();
         return;
       }
+      iface.resume();
+      showPrompt();
     } else {
-      // Resolve image placeholders → actual file paths before sending
+      // Free-form chat → queue and return immediately so readline stays active.
+      // The user can keep typing/submitting; messages are processed in order.
       let message = input;
       for (const [placeholder, filePath] of imageMap) {
         if (message.includes(placeholder)) {
@@ -510,19 +546,12 @@ export async function runRepl(
           imageMap.delete(placeholder);
         }
       }
-      // Free-form chat — the scroll region keeps status+separator fixed at bottom
-      // while content streams naturally through the scroll area above.
-      await chatSession.send(message);
+      _msgQueue.push(message);
+      showPrompt(); // show prompt immediately so user can type next message
+      void drainQueue(); // process queue in background (non-blocking)
     }
-
-    iface.resume();
-    showPrompt();
   });
 
-  // Activate the permanent scroll-region layout (reserves bottom 2 rows for
-  // separator + status).  Must be called AFTER the banner so the banner goes
-  // to the full-screen area before DECSTBM narrows the scroll region.
-  layout.init();
   showPrompt();
 
   // Wait for close
