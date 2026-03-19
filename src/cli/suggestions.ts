@@ -57,9 +57,10 @@ export function showSuggestions(partial: string): void {
     return `  ${name}${alias}  ${chalk.gray(c.desc)}`;
   });
 
-  // Write suggestion lines below current line using relative movement
+  // Write suggestion lines below current line using relative movement.
+  // \r resets to column 0 before each write to prevent column-drift wrapping.
   for (const row of rows) {
-    process.stdout.write("\n\x1b[2K" + row);
+    process.stdout.write("\n\r\x1b[2K" + row);
   }
 
   // Move cursor back up (relative — works after any amount of scrolling)

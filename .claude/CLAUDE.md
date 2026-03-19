@@ -35,3 +35,11 @@ If you cannot confidently fill in all three fields above, ask the user **one foc
 ## Step 4 — Verify completion against the stated target
 
 When done, confirm each item in `Done when:` is actually true. If verification fails, fix and re-verify before declaring done.
+
+## Bug Fix Rule
+
+Every bug fix **must** include tests that:
+1. Cover the fixed behavior (proves the fix works)
+2. Include a regression baseline that confirms the old buggy behavior existed (so future regressions are caught)
+
+A bug fix without passing tests is **incomplete**. Do not declare done until `bun test` passes.
