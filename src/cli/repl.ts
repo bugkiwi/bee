@@ -165,6 +165,15 @@ function printSessionSummary(chat: ChatSession): void {
     parts.push(full(toolRow, 2 + topToolsVisible));
   }
 
+  // Resume hint with session ID
+  const sid = chat.beeSession?.id;
+  if (sid) {
+    const resumeHint = `  ${chalk.gray("Resume:")} bee --resume ${chalk.cyan(sid.slice(0, 8))}`;
+    const resumeVisible = 2 + 7 + 1 + 14 + 1 + 8; // "  Resume: bee --resume xxxxxxxx"
+    parts.push(chalk.dim(`├${border}┤`));
+    parts.push(full(resumeHint, resumeVisible));
+  }
+
   parts.push(chalk.dim(`╰${border}╯`), "");
   console.log(parts.join("\n"));
 }

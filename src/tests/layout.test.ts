@@ -150,22 +150,17 @@ describe("ReplLayout: enterContent() uses SCO restore", () => {
   });
 });
 
-describe("ReplLayout: enterPrompt() saves content cursor and moves to prompt row", () => {
+describe("ReplLayout: enterPrompt() moves to prompt row without saving", () => {
   beforeEach(() => setupFakeStdout(24, 80));
   afterEach(() => teardownFakeStdout());
 
-  it("saves content cursor with SCO save before moving", () => {
+  it("does NOT emit SCO save (only saveContent does that)", () => {
     const layout = new ReplLayout(new StatusLine());
     layout.init();
     captured = [];
 
     layout.enterPrompt();
-    const output = allOutput();
-    // SCO save should come before CUP to prompt row
-    const saveIdx = output.indexOf("\x1b[s");
-    const cupIdx = output.indexOf("\x1b[23;1H");
-    expect(saveIdx).toBeGreaterThanOrEqual(0);
-    expect(cupIdx).toBeGreaterThan(saveIdx);
+    expect(allOutput()).not.toContain("\x1b[s");
   });
 
   it("moves to rows-1 (23) and clears line", () => {

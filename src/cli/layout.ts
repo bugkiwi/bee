@@ -78,14 +78,13 @@ export class ReplLayout {
   }
 
   /**
-   * Save the content cursor (SCO save) and move to the prompt row (rows-1).
-   * Call before iface.prompt().
+   * Move cursor to the prompt row (rows-1) and clear it.
+   * Does NOT save the content cursor — call saveContent() explicitly
+   * after content writes, before calling enterPrompt().
    */
   enterPrompt(): void {
     if (!process.stdout.isTTY) return;
     const rows = process.stdout.rows ?? 24;
-    // Save content cursor so enterContent() can return here later
-    process.stdout.write("\x1b[s");
     process.stdout.write(`\x1b[${rows - 1};1H\x1b[2K`);
   }
 
