@@ -233,7 +233,10 @@ export async function runRepl(
       }
       layout.refreshStatus();
     },
+    projectPath: process.cwd(),
   });
+  // Initialize persistent session (non-blocking — don't delay REPL startup)
+  void chatSession.initSession();
   // image placeholder → resolved file path (populated async after clipboard save)
   const imageMap = new Map<string, string>();
   let _clipPoller: ReturnType<typeof setInterval> | undefined;

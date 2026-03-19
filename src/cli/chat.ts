@@ -1,5 +1,7 @@
 import chalk from "chalk";
 import type { WorkspaceConfig } from "../types/config.ts";
+import type { BeeSession } from "../session/manager.ts";
+import { SessionManager } from "../session/manager.ts";
 
 // ─── Content block types ──────────────────────────────────────────────────────
 
@@ -134,14 +136,9 @@ function detectAuthError(stderr: string, provider: string): string | null {
   return null;
 }
 
-export interface ChatMessage {
-  role: "user" | "assistant";
-  content: string;
-}
-
 // ─── In-place emoji spinner ───────────────────────────────────────────────────
 // Cycles through frames in-place with \r, no movement track.
-const SPIN_FRAMES = ["🐝", "🌸", "🍯", "🐝"];
+const SPIN_FRAMES = ["🌻", "🌸", "🌺", "🌼", "🍯", "🌻"];
 
 function startSpinner(label: string): () => void {
   if (!process.stdout.isTTY) return () => {};
@@ -158,6 +155,14 @@ function startSpinner(label: string): () => void {
 }
 
 // ─── ChatSession ─────────────────────────────────────────────────────────────
+//
+// Uses provider-native session continuation instead of rebuilding prompts:
+//   - Claude: --session-id <uuid>  (Claude CLI maintains conversation)
+//   - Codex:  --session-id passed in args (Codex maintains conversation)
+//   - Kimi:   --session <id>       (Kimi CLI maintains conversation)
+//
+// No message history is stored in-process — the provider owns the context.
+// This eliminates the O(n) token growth of the old buildPrompt() approach.
 
 export interface SessionStats {
   durationMs: number;
@@ -170,23 +175,75 @@ export interface SessionStats {
 export interface ChatOptions {
   /** Called with a message when the session starts working, null when done. */
   onStatusUpdate?: (message: string | null) => void;
+  /** Project root path for session persistence. */
+  projectPath?: string;
 }
 
 export class ChatSession {
-  private history: ChatMessage[] = [];
   private sessionStart = Date.now();
   private totalTools = 0;
   private toolCounts = new Map<string, number>();
   private linesChanged = 0;
+  private _messageCount = 0;
 
-  constructor(private config: WorkspaceConfig, private opts: ChatOptions = {}) {}
+  // ── Provider-native session IDs ──────────────────────────────────────────
+  // These are the IDs used by each provider's CLI to resume conversations.
+  // Allocated lazily on first send to each provider.
+  private _claudeSessionId: string | null = null;
+  private _codexSessionId: string | null = null;
+  private _kimiSessionId: string | null = null;
 
-  get messageCount(): number {
-    return this.history.length;
+  // ── Persistent session (optional) ────────────────────────────────────────
+  private _sessionManager: SessionManager | null = null;
+  private _beeSession: BeeSession | null = null;
+
+  constructor(private config: WorkspaceConfig, private opts: ChatOptions = {}) {
+    if (opts.projectPath) {
+      this._sessionManager = new SessionManager(opts.projectPath);
+    }
   }
 
+  get messageCount(): number {
+    return this._messageCount;
+  }
+
+  /** Reset native session IDs — starts fresh conversations with all providers. */
   clearHistory(): void {
-    this.history = [];
+    this._claudeSessionId = null;
+    this._codexSessionId = null;
+    this._kimiSessionId = null;
+    this._messageCount = 0;
+  }
+
+  /** Get the current bee session (if persisted). */
+  get beeSession(): BeeSession | null {
+    return this._beeSession;
+  }
+
+  /** Initialize or resume a persistent session. Call once after construction. */
+  async initSession(resumeSessionId?: string): Promise<BeeSession> {
+    if (!this._sessionManager) {
+      this._sessionManager = new SessionManager(this.opts.projectPath ?? process.cwd());
+    }
+    if (resumeSessionId) {
+      const existing = await this._sessionManager.load(resumeSessionId);
+      if (existing) {
+        this._beeSession = existing;
+        // Restore native session IDs from persisted bindings
+        for (const [name, binding] of Object.entries(existing.providers)) {
+          if (binding.nativeId) {
+            if (name === "claude") this._claudeSessionId = binding.nativeId;
+            else if (name === "codex") this._codexSessionId = binding.nativeId;
+            else if (name === "kimi") this._kimiSessionId = binding.nativeId;
+          }
+        }
+        this._messageCount = existing.messageCount;
+        return existing;
+      }
+    }
+    // Create new session
+    this._beeSession = await this._sessionManager.create(this.config.provider);
+    return this._beeSession;
   }
 
   private accumulateStats(s: ToolTrackerStats): void {
@@ -200,7 +257,7 @@ export class ChatSession {
   getSessionStats(): SessionStats {
     return {
       durationMs: Date.now() - this.sessionStart,
-      messages: this.history.filter(m => m.role === "user").length,
+      messages: this._messageCount,
       totalTools: this.totalTools,
       toolCounts: this.toolCounts,
       linesChanged: this.linesChanged,
@@ -209,60 +266,89 @@ export class ChatSession {
 
   /**
    * Send a user message to the configured provider and stream the response.
-   * Returns the assistant's reply, or null on error.
+   * Uses provider-native session continuation — no prompt rebuilding.
    */
   async send(userMessage: string): Promise<void> {
-    this.history.push({ role: "user", content: userMessage });
+    this._messageCount++;
     this.opts.onStatusUpdate?.("thinking…");
     console.log(); // blank line before response
-
-    let reply: string | null = null;
 
     try {
       switch (this.config.provider) {
         case "claude":
-          reply = await this.sendClaude(userMessage);
+          await this.sendClaude(userMessage);
           break;
         case "codex":
-          reply = await this.sendCodex(userMessage);
+          await this.sendCodex(userMessage);
           break;
         case "kimi":
-          reply = await this.sendKimi(userMessage);
+          await this.sendKimi(userMessage);
           break;
         default:
-          reply = await this.sendClaude(userMessage);
+          await this.sendClaude(userMessage);
       }
     } catch (err) {
       console.error(chalk.red(`  Error: ${String(err)}\n`));
-      this.history.pop(); // remove failed user message
+      this._messageCount--;
       return;
     } finally {
       this.opts.onStatusUpdate?.(null);
     }
 
-    if (reply !== null) {
-      this.history.push({ role: "assistant", content: reply });
+    // Persist session state (non-blocking)
+    if (this._sessionManager && this._beeSession) {
+      void this._sessionManager.recordMessage(this._beeSession);
     }
 
     console.log(); // blank line after response
   }
 
   // ── Claude ─────────────────────────────────────────────────────────────────
+  // Uses --session-id to maintain conversation natively.
+  // First call: generates a UUID for the session.
+  // Subsequent calls: --resume <session-id> continues the conversation.
 
   private async sendClaude(userMessage: string): Promise<string> {
-    const prompt = this.buildPrompt(userMessage);
     const model = this.config.model ?? "claude-sonnet-4-6";
+
+    // Allocate a native session ID on first call
+    const isFirstMessage = this._claudeSessionId === null;
+    if (isFirstMessage) {
+      this._claudeSessionId = crypto.randomUUID();
+    }
 
     const stopSpinner = startSpinner("thinking…");
     let spinnerStopped = false;
     const tracker = new ToolTracker();
 
-    // Mirror ClaudeProvider edit-mode: prompt via stdin, stream-json events,
-    // --dangerously-skip-permissions so Claude can use file-editing tools.
-    const proc = Bun.spawn(
-      ["claude", "--dangerously-skip-permissions", "--model", model, "--output-format", "stream-json", "--verbose"],
-      { stdin: new Blob([prompt]), stdout: "pipe", stderr: "pipe" }
-    );
+    // Build args: first message uses --session-id, subsequent use --resume
+    const args = [
+      "claude",
+      "--dangerously-skip-permissions",
+      "--model", model,
+      "--output-format", "stream-json",
+      "--verbose",
+    ];
+
+    if (isFirstMessage) {
+      // First message: establish a new session with this ID
+      args.push("--session-id", this._claudeSessionId!);
+    } else {
+      // Subsequent messages: resume the existing session
+      args.push("--resume", this._claudeSessionId!);
+    }
+
+    // Prompt goes via stdin (edit mode)
+    const proc = Bun.spawn(args, {
+      stdin: new Blob([userMessage]),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    // Persist native ID to bee session
+    if (this._sessionManager && this._beeSession && isFirstMessage) {
+      void this._sessionManager.bindNativeId(this._beeSession, "claude", this._claudeSessionId!);
+    }
 
     // Drain stderr concurrently to prevent buffer deadlock
     const stderrProm = new Response(proc.stderr).text().catch(() => "");
@@ -291,6 +377,7 @@ export class ChatSession {
           if (!trimmed) continue;
           let ev: {
             type?: string;
+            session_id?: string;
             message?: { content?: ContentBlock[] };
             result?: string;
             name?: string;
@@ -298,7 +385,13 @@ export class ChatSession {
           };
           try { ev = JSON.parse(trimmed); } catch { continue; }
 
-          if (ev.type === "system") continue; // skip init handshake
+          if (ev.type === "system") {
+            // Claude emits session_id in the system init event
+            if (ev.session_id && !this._claudeSessionId) {
+              this._claudeSessionId = ev.session_id;
+            }
+            continue;
+          }
           stopOnce();
 
           if (ev.type === "assistant" && Array.isArray(ev.message?.content)) {
@@ -347,11 +440,21 @@ export class ChatSession {
   }
 
   // ── Codex ──────────────────────────────────────────────────────────────────
+  // Uses `codex resume <session-id> <prompt>` for continuation.
 
   private async sendCodex(userMessage: string): Promise<string> {
     const stopSpinner = startSpinner("thinking…");
 
-    const proc = Bun.spawn(["codex", "--quiet", userMessage], {
+    let args: string[];
+    if (this._codexSessionId) {
+      // Resume existing conversation
+      args = ["codex", "resume", this._codexSessionId, userMessage];
+    } else {
+      // New conversation
+      args = ["codex", "--quiet", userMessage];
+    }
+
+    const proc = Bun.spawn(args, {
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -360,7 +463,21 @@ export class ChatSession {
     stopSpinner();
     await proc.exited;
 
+    // Try to capture session ID from codex output/stderr for future resumption
     const stderrText = await new Response(proc.stderr).text().catch(() => "");
+
+    // Codex prints session info to stderr; try to extract session ID
+    if (!this._codexSessionId) {
+      const match = stderrText.match(/session[_\s]?id[:\s]+([a-f0-9-]+)/i)
+        ?? text.match(/session[_\s]?id[:\s]+([a-f0-9-]+)/i);
+      if (match) {
+        this._codexSessionId = match[1]!;
+        if (this._sessionManager && this._beeSession) {
+          void this._sessionManager.bindNativeId(this._beeSession, "codex", this._codexSessionId);
+        }
+      }
+    }
+
     const authErr = detectAuthError(stderrText, "codex");
     if (authErr) throw new Error(authErr);
     if (proc.exitCode !== 0 && stderrText.trim()) throw new Error(stderrText.trim());
@@ -371,12 +488,20 @@ export class ChatSession {
   }
 
   // ── Kimi ───────────────────────────────────────────────────────────────────
+  // Uses --session <id> for conversation continuation.
+  // First call: let Kimi allocate a session, capture from output.
+  // Subsequent calls: --session <id> resumes.
 
   private async sendKimi(userMessage: string): Promise<string> {
-    const prompt = this.buildPrompt(userMessage);
     const stopSpinner = startSpinner("thinking…");
 
-    const proc = Bun.spawn(["kimi", "--print", prompt], {
+    const args = ["kimi", "--print", userMessage];
+    if (this._kimiSessionId) {
+      // Resume existing session
+      args.splice(1, 0, "--session", this._kimiSessionId);
+    }
+
+    const proc = Bun.spawn(args, {
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -404,32 +529,22 @@ export class ChatSession {
     await proc.exited;
 
     const stderrText = await new Response(proc.stderr).text().catch(() => "");
+
+    // Capture Kimi session ID from stderr for future continuation
+    if (!this._kimiSessionId) {
+      const match = stderrText.match(/session[_\s]?(?:id)?[:\s]+([a-f0-9-]+)/i);
+      if (match) {
+        this._kimiSessionId = match[1]!;
+        if (this._sessionManager && this._beeSession) {
+          void this._sessionManager.bindNativeId(this._beeSession, "kimi", this._kimiSessionId);
+        }
+      }
+    }
+
     const authErr = detectAuthError(stderrText, "kimi");
     if (authErr) throw new Error(authErr);
     if (proc.exitCode !== 0 && stderrText.trim()) throw new Error(stderrText.trim());
 
     return fullText.trim();
-  }
-
-  // ── Conversation history formatting ────────────────────────────────────────
-
-  /**
-   * Build a multi-turn prompt for providers that don't natively support
-   * message arrays (claude/codex CLI).
-   */
-  private buildPrompt(currentUserMessage: string): string {
-    // Single-turn: just send the message directly
-    if (this.history.length <= 1) return currentUserMessage;
-
-    // Multi-turn: include up to last 10 turns as context
-    const context = this.history.slice(Math.max(0, this.history.length - 11), -1);
-    const lines: string[] = [];
-    for (const msg of context) {
-      const speaker = msg.role === "user" ? "Human" : "Assistant";
-      lines.push(`${speaker}: ${msg.content}`);
-    }
-    lines.push(`Human: ${currentUserMessage}`);
-    lines.push("Assistant:");
-    return lines.join("\n\n");
   }
 }

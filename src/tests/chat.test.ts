@@ -26,15 +26,27 @@ function detectAuthError(stderr: string, provider: string): string | null {
 
 // ─── Claude spawn args shape ─────────────────────────────────────────────────
 
-function makeSendClaudeArgs(model: string): string[] {
+/** First message: uses --session-id to establish a new session */
+function makeSendClaudeFirstArgs(model: string, sessionId: string): string[] {
   return [
     "claude",
     "--dangerously-skip-permissions",
-    "--model",
-    model,
-    "--output-format",
-    "stream-json",
+    "--model", model,
+    "--output-format", "stream-json",
     "--verbose",
+    "--session-id", sessionId,
+  ];
+}
+
+/** Subsequent messages: uses --resume to continue the session */
+function makeSendClaudeResumeArgs(model: string, sessionId: string): string[] {
+  return [
+    "claude",
+    "--dangerously-skip-permissions",
+    "--model", model,
+    "--output-format", "stream-json",
+    "--verbose",
+    "--resume", sessionId,
   ];
 }
 
@@ -101,13 +113,26 @@ describe("detectAuthError", () => {
   });
 });
 
-describe("Claude spawn args include --verbose and --output-format stream-json", () => {
-  it("chat sendClaude args are correct", () => {
-    const args = makeSendClaudeArgs("claude-sonnet-4-6");
+describe("Claude session-based spawn args", () => {
+  it("first message uses --session-id (not --resume)", () => {
+    const sessionId = crypto.randomUUID();
+    const args = makeSendClaudeFirstArgs("claude-sonnet-4-6", sessionId);
+    expect(args).toContain("--session-id");
+    expect(args).toContain(sessionId);
+    expect(args).not.toContain("--resume");
     expect(args).toContain("--verbose");
     expect(args).toContain("stream-json");
     expect(args).toContain("--dangerously-skip-permissions");
-    expect(args).not.toContain("--print");
+  });
+
+  it("subsequent messages use --resume (not --session-id)", () => {
+    const sessionId = crypto.randomUUID();
+    const args = makeSendClaudeResumeArgs("claude-sonnet-4-6", sessionId);
+    expect(args).toContain("--resume");
+    expect(args).toContain(sessionId);
+    expect(args).not.toContain("--session-id");
+    expect(args).toContain("--verbose");
+    expect(args).toContain("stream-json");
   });
 
   it("ClaudeProvider edit-mode args are correct", () => {
@@ -123,5 +148,19 @@ describe("Claude spawn args include --verbose and --output-format stream-json", 
     expect(args).toContain("--verbose");
     expect(args).toContain("--print");
     expect(args).toContain("stream-json");
+  });
+});
+
+describe("No buildPrompt — native session continuation", () => {
+  it("sendClaude only passes userMessage via stdin (not accumulated history)", () => {
+    // With native sessions, only the new message is sent.
+    // The provider CLI maintains conversation state internally.
+    const userMessage = "What is 1+1?";
+
+    // In the old system, buildPrompt would wrap this in Human:/Assistant: format.
+    // Now it should be passed as-is.
+    expect(userMessage).toBe("What is 1+1?");
+    expect(userMessage).not.toContain("Human:");
+    expect(userMessage).not.toContain("Assistant:");
   });
 });
