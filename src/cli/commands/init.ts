@@ -7,12 +7,9 @@ import chalk from "chalk";
 export async function runInit(root: string): Promise<void> {
   console.log(chalk.bold.cyan("\n⚙  BEE Init\n"));
 
-  const dirs = ["tasks", "state", "specs", "logs", "providers", ".bee"];
-  for (const dir of dirs) {
-    const path = join(root, dir);
-    await mkdir(path, { recursive: true });
-    console.log(chalk.gray(`  created ${dir}/`));
-  }
+  const beeDir = join(root, ".bee");
+  await mkdir(beeDir, { recursive: true });
+  console.log(chalk.gray("  created .bee/"));
 
   const configPath = join(root, ".bee", "config.json");
   if (!existsSync(configPath)) {
@@ -42,7 +39,7 @@ export async function runInit(root: string): Promise<void> {
 
   console.log(chalk.green("\n✓ Workspace initialized.\n"));
   console.log("Next steps:");
-  console.log("  1. Place spec files in specs/");
-  console.log("  2. Run: bee plan specs/your-spec.md");
+  console.log("  1. Prepare a spec markdown file");
+  console.log("  2. Run: bee plan path/to/your-spec.md");
   console.log("  3. Run: bee run\n");
 }

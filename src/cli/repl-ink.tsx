@@ -21,44 +21,13 @@ import { readJsonLines, listFiles, writeJsonFile } from "../utils/fs.ts";
 import type { TraceEvent } from "../types/observability.ts";
 import { printTaskTable, colorStatus } from "./output.ts";
 import { showRtkGain } from "../plugins/rtk.ts";
-import { BEE_ICON } from "./bee.ts";
+import { showBeeIntro } from "./bee.ts";
 import { ChatSession } from "./chat.ts";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { ReplayReader } from "../observability/replay.ts";
 import { App } from "./ui/App.tsx";
-
-// ─── Banner ───────────────────────────────────────────────────────────────────
-
-const BOX_W = 43;
-
-function boxLine(content: string, visibleLen: number): string {
-  const pad = " ".repeat(Math.max(0, BOX_W - visibleLen));
-  return chalk.bold.cyan("║") + content + pad + chalk.bold.cyan("║");
-}
-
-function makeBanner(provider: string, useRtk: boolean): string {
-  const rtkStr = useRtk ? " ⚡RTK" : "";
-  const titleContent = `  ${BEE_ICON}  ${chalk.bold.yellow("BEE")} ${chalk.gray("— Busy Buzzing Agent")}  `;
-  const titleVisible = 2 + 5 + 2 + 3 + 1 + 20 + 2;
-
-  const provContent = `  ${chalk.gray(`provider: ${chalk.cyan(provider)}${rtkStr}`)}  `;
-  const provVisible = 2 + 10 + provider.length + rtkStr.length + 2;
-
-  const helpContent = `  ${chalk.gray("type /help for commands, /exit to quit")}  `;
-  const helpVisible = 2 + 38 + 2;
-
-  const border = "═".repeat(BOX_W);
-  return [
-    "",
-    chalk.bold.cyan(`╔${border}╗`),
-    boxLine(titleContent, titleVisible),
-    boxLine(provContent, provVisible),
-    boxLine(helpContent, helpVisible),
-    chalk.bold.cyan(`╚${border}╝`),
-    "",
-  ].join("\n");
-}
+import { clearTerminalScreen, enterAlternateScreen, exitAlternateScreen } from "./ui/terminal.ts";
 
 // ─── Session summary ──────────────────────────────────────────────────────────
 
@@ -266,7 +235,7 @@ async function switchProvider(
     config.provider = target;
   }
 
-  const configPath = dirs.config ?? join(dirs.logs, "..", ".bee", "config.json");
+  const configPath = dirs.config ?? join(process.cwd(), ".bee", "config.json");
   await writeJsonFile(configPath, config);
 
   console.log(chalk.green(`\n  ✓ Switched to ${chalk.bold(target)}\n`));
@@ -336,7 +305,7 @@ async function handleCommand(
         console.log(chalk.yellow(`\n  Provider "${provider}" hit a limit: ${message}`));
         console.log(chalk.gray(`  Ink mode auto-switch: ${chalk.cyan(fallback)}\n`));
         config.provider = fallback;
-        const configPath = join(dirs.logs, "..", ".bee", "config.json");
+        const configPath = dirs.config;
         await writeJsonFile(configPath, config);
         return fallback;
       };
@@ -515,7 +484,7 @@ async function handleCommand(
     }
 
     case "config": {
-      const configPath = join(dirs.logs, "..", ".bee", "config.json");
+      const configPath = dirs.config;
       try {
         const raw = await Bun.file(configPath).text();
         console.log("\n" + chalk.gray(raw) + "\n");
@@ -582,8 +551,9 @@ async function handleCommand(
 export async function runRepl(
   config: WorkspaceConfig,
   dirs: { tasks: string; state: string; logs: string; config: string },
-  opts: { resumeSessionId?: string; resumeLatest?: boolean } = {}
+  opts: { resumeSessionId?: string; resumeLatest?: boolean; showIntro?: boolean } = {}
 ): Promise<void> {
+  const renderStream = process.stderr.isTTY ? process.stderr : process.stdout;
   const chatSession = new ChatSession(config, {
     onStatusUpdate: () => {},  // Ink component handles status display
     projectPath: process.cwd(),
@@ -593,18 +563,18 @@ export async function runRepl(
     resumeLatest: opts.resumeLatest,
   });
 
-  const banner = makeBanner(config.provider, config.use_rtk ?? false);
   const initialStatus = await getStatusLines(dirs);
   const initialTranscript = chatSession.transcript.map((line) => ({
     type: line.type,
     text: line.text,
   }));
 
-  const { waitUntilExit } = render(
+  let viewportEpoch = 0;
+  const appNode = () => (
     <App
+      viewportEpoch={viewportEpoch}
       config={config}
       chatSession={chatSession}
-      banner={banner}
       initialStatus={initialStatus}
       initialTranscript={initialTranscript}
       onCommand={(cmd, args) => handleCommand(cmd, args, config, dirs, chatSession)}
@@ -618,9 +588,42 @@ export async function runRepl(
         );
       }}
       onExit={() => getSessionSummaryLines(chatSession)}
-    />,
-    { exitOnCtrlC: false }
+    />
   );
 
-  await waitUntilExit();
+  enterAlternateScreen(renderStream);
+  clearTerminalScreen(renderStream);
+
+  try {
+    if (opts.showIntro) {
+      await showBeeIntro(renderStream);
+    }
+
+    const ink = render(appNode(), {
+      stdout: renderStream,
+      stderr: renderStream,
+      exitOnCtrlC: false,
+    });
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+    const repaint = () => {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        viewportEpoch += 1;
+        clearTerminalScreen(renderStream);
+        ink.rerender(appNode());
+      }, 24);
+    };
+    renderStream.on("resize", repaint);
+
+    try {
+      await ink.waitUntilExit();
+    } finally {
+      renderStream.off("resize", repaint);
+      if (resizeTimer) clearTimeout(resizeTimer);
+    }
+  } finally {
+    exitAlternateScreen(renderStream);
+    const summaryLines = getSessionSummaryLines(chatSession);
+    console.log(summaryLines.join("\n"));
+  }
 }

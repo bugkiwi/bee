@@ -32,6 +32,10 @@ function canUseInkRepl(): boolean {
   );
 }
 
+function shouldShowBeeIntro(): boolean {
+  return !process.env.CI && process.env.BEE_NO_INTRO !== "1";
+}
+
 function parseInteractiveModeArgs(args: string[]): InteractiveModeArgs {
   if (args.length === 0) return { isInteractive: true };
 
@@ -111,6 +115,7 @@ async function main() {
     await runInkRepl(config, dirs, {
       resumeSessionId: interactiveModeArgs.resumeSessionId,
       resumeLatest: interactiveModeArgs.resumeLatest,
+      showIntro: shouldShowBeeIntro(),
     });
     return;
   }

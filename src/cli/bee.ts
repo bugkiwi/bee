@@ -1,4 +1,5 @@
 import chalk from "chalk";
+import type { WriteStream } from "node:tty";
 
 // ─── Bee ASCII frames (wings: up / mid / down) ───────────────────────────────
 
@@ -37,6 +38,8 @@ const FRAMES: Frame[] = [
 ];
 
 const FRAME_HEIGHT = FRAMES[0]!.length;
+const INTRO_FRAME_DELAY_MS = 120;
+const INTRO_FRAME_COUNT = 12;
 
 // ─── ANSI helpers ─────────────────────────────────────────────────────────────
 
@@ -46,18 +49,18 @@ const up    = (n: number) => `\x1b[${n}A`;
 const col   = (n: number) => `\x1b[${n}G`;
 const clear = "\x1b[2K";
 
-function printFrame(frame: Frame, xOffset: number) {
+function writeFrame(target: WriteStream, frame: Frame, xOffset: number) {
   for (const line of frame) {
-    process.stdout.write(clear + col(xOffset) + line + "\n");
+    target.write(clear + col(xOffset) + line + "\n");
   }
 }
 
-function eraseBee() {
-  process.stdout.write(up(FRAME_HEIGHT));
+function eraseBee(target: WriteStream) {
+  target.write(up(FRAME_HEIGHT));
   for (let i = 0; i < FRAME_HEIGHT; i++) {
-    process.stdout.write(clear + "\n");
+    target.write(clear + "\n");
   }
-  process.stdout.write(up(FRAME_HEIGHT));
+  target.write(up(FRAME_HEIGHT));
 }
 
 function sleep(ms: number): Promise<void> {
@@ -66,26 +69,26 @@ function sleep(ms: number): Promise<void> {
 
 // ─── Full animated intro ──────────────────────────────────────────────────────
 
-export async function showBeeIntro(): Promise<void> {
-  const ttyWidth = process.stdout.columns ?? 80;
+export async function showBeeIntro(target: WriteStream = process.stdout): Promise<void> {
+  const ttyWidth = target.columns ?? 80;
   const beeWidth = 12;
   const centerX = Math.floor(ttyWidth / 2) - Math.floor(beeWidth / 2);
 
-  process.stdout.write(hide);
+  target.write(hide);
+  try {
+    // Reserve vertical space
+    for (let i = 0; i < FRAME_HEIGHT; i++) target.write("\n");
 
-  // Reserve vertical space
-  for (let i = 0; i < FRAME_HEIGHT; i++) process.stdout.write("\n");
+    for (let i = 0; i < INTRO_FRAME_COUNT; i++) {
+      target.write(up(FRAME_HEIGHT));
+      writeFrame(target, FRAMES[i % FRAMES.length]!, centerX);
+      await sleep(INTRO_FRAME_DELAY_MS);
+    }
 
-  // Flap wings at center
-  for (let i = 0; i < 9; i++) {
-    process.stdout.write(up(FRAME_HEIGHT));
-    printFrame(FRAMES[i % FRAMES.length]!, centerX);
-    await sleep(100);
+    eraseBee(target);
+  } finally {
+    target.write(show);
   }
-
-  // Disappear
-  eraseBee();
-  process.stdout.write(show);
 }
 
 // ─── Inline bee for the banner (static, color) ────────────────────────────────
@@ -100,11 +103,11 @@ export function startIdleFlap(xOffset = 2): NodeJS.Timeout {
   // Reserve 1 line below prompt — REPL must not be printing
   // This is best-effort; call stopIdleFlap() before any output
   process.stdout.write("\n");
-  printFrame(FRAMES[0]!, xOffset);
+  writeFrame(process.stdout, FRAMES[0]!, xOffset);
 
   const timer = setInterval(() => {
     process.stdout.write(up(FRAME_HEIGHT));
-    printFrame(FRAMES[frame % FRAMES.length]!, xOffset);
+    writeFrame(process.stdout, FRAMES[frame % FRAMES.length]!, xOffset);
     frame++;
   }, 150);
 
@@ -113,5 +116,5 @@ export function startIdleFlap(xOffset = 2): NodeJS.Timeout {
 
 export function stopIdleFlap(timer: NodeJS.Timeout) {
   clearInterval(timer);
-  eraseBee();
+  eraseBee(process.stdout);
 }

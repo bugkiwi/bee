@@ -4,11 +4,9 @@ node_modules/
 # Build output
 dist/
 
-# Runtime state & logs
-logs/
-
 # Local config
 .bee/
+package-lock.json
 
 # Environment
 .env

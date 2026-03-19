@@ -13,377 +13,32 @@
  */
 
 import { useState, useCallback, useEffect, useRef, useMemo } from "react";
-import { Box, Text, useApp, useFocus, useFocusManager, useInput, useStdin } from "ink";
-import { TextInput } from "@inkjs/ui";
+import { Box, Text, useApp, useFocusManager, useInput, useStdin, useStdout } from "ink";
 import stringWidth from "string-width";
 import type { WorkspaceConfig } from "../../types/config.ts";
 import type { ChatSession, ChatRenderHooks } from "../chat.ts";
 import { SLASH_COMMANDS, resolveCommand } from "../commands.ts";
 import { resolveClickAction } from "./click-behavior.ts";
-
-// ─── Types ───────────────────────────────────────────────────────────────────
-
-export interface ContentLine {
-  id: string;
-  text: string;
-  type: "banner" | "user" | "assistant" | "system" | "tool" | "shell" | "error" | "thinking";
-}
-
-export interface ProviderPickerOptions {
-  options: string[];
-  active: string;
-}
-
-interface SlashQuickOption {
-  key: string;
-  command: string;
-  desc: string;
-  commandText: string;
-  requiresArgs: boolean;
-}
-
-interface ProviderQuickOption {
-  key: string;
-  label: string;
-  desc: string;
-}
-
-type RenderItem =
-  | { kind: "line"; line: ContentLine }
-  | { kind: "thinking-group"; id: string; lines: ContentLine[] };
-
-const INPUT_FOCUS_ID = "bee-input";
-const THINKING_SUMMARY_MAX = 80;
-const MAX_HISTORY_ENTRIES = 100;
-
-interface MouseClickEvent {
-  x: number;
-  y: number;
-  shift: boolean;
-  ctrl: boolean;
-  meta: boolean;
-}
-
-interface CursorReport {
-  row: number;
-  col: number;
-}
-
-interface TerminalExtractResult {
-  clean: string;
-  clicks: MouseClickEvent[];
-  cursorReports: CursorReport[];
-  remainder: string;
-}
-
-function extractTerminalEvents(data: string, remainder = ""): TerminalExtractResult {
-  const input = remainder + data;
-  const clicks: MouseClickEvent[] = [];
-  const cursorReports: CursorReport[] = [];
-  const cleanParts: string[] = [];
-  let i = 0;
-
-  while (i < input.length) {
-    const escIndex = input.indexOf("\x1b", i);
-    if (escIndex === -1) {
-      cleanParts.push(input.slice(i));
-      i = input.length;
-      break;
-    }
-
-    cleanParts.push(input.slice(i, escIndex));
-    const rest = input.slice(escIndex);
-
-    const mouseMatch = /^\x1b\[<(\d+);(\d+);(\d+)([mM])/.exec(rest);
-    if (mouseMatch) {
-      i = escIndex + mouseMatch[0].length;
-      const rawCode = Number.parseInt(mouseMatch[1] ?? "", 10);
-      const x = Number.parseInt(mouseMatch[2] ?? "", 10);
-      const y = Number.parseInt(mouseMatch[3] ?? "", 10);
-      const suffix = mouseMatch[4] ?? "";
-
-      if (Number.isFinite(rawCode) && Number.isFinite(x) && Number.isFinite(y) && suffix === "M") {
-        const isMotion = (rawCode & 32) !== 0;
-        const isWheel = (rawCode & 64) !== 0;
-        const button = rawCode & 3;
-        if (!isMotion && !isWheel && button === 0) {
-          clicks.push({
-            x,
-            y,
-            shift: (rawCode & 4) !== 0,
-            meta: (rawCode & 8) !== 0,
-            ctrl: (rawCode & 16) !== 0,
-          });
-        }
-      }
-      continue;
-    }
-
-    const cursorMatch = /^\x1b\[(\d+);(\d+)R/.exec(rest);
-    if (cursorMatch) {
-      i = escIndex + cursorMatch[0].length;
-      const row = Number.parseInt(cursorMatch[1] ?? "", 10);
-      const col = Number.parseInt(cursorMatch[2] ?? "", 10);
-      if (Number.isFinite(row) && Number.isFinite(col)) {
-        cursorReports.push({ row, col });
-      }
-      continue;
-    }
-
-    const isMousePartial = /^\x1b\[<[\d;]*$/.test(rest);
-    const isCursorPartial = /^\x1b\[\d*(?:;\d*)?$/.test(rest);
-    if (isMousePartial || isCursorPartial) {
-      return {
-        clean: cleanParts.join(""),
-        clicks,
-        cursorReports,
-        remainder: rest,
-      };
-    }
-
-    // Preserve unknown/other escape sequences for Ink key parser.
-    cleanParts.push("\x1b");
-    i = escIndex + 1;
-  }
-
-  return {
-    clean: cleanParts.join(""),
-    clicks,
-    cursorReports,
-    remainder: "",
-  };
-}
-
-function summarizeThinking(text: string): { summary: string; full: string; truncated: boolean } {
-  const full = text.trimStart();
-  if (full.length <= THINKING_SUMMARY_MAX) {
-    return { summary: full, full, truncated: false };
-  }
-  return {
-    summary: `${full.slice(0, THINKING_SUMMARY_MAX)}…`,
-    full,
-    truncated: true,
-  };
-}
-
-function isGenericThinkingLine(text: string): boolean {
-  const trimmed = text.trim();
-  const withoutPrefix = trimmed.replace(/^[^\p{L}\p{N}]+/u, "").trim();
-  return /^thinking(?:\.{3}|…)?$/i.test(withoutPrefix);
-}
-
-function isCollapsibleThinkingLine(text: string): boolean {
-  if (isGenericThinkingLine(text)) return false;
-  return /\S/.test(text);
-}
-
-function rowsForText(text: string, width: number): number {
-  const w = Math.max(1, width);
-  return Math.max(1, Math.ceil(stringWidth(text) / w));
-}
-
-function normalizeUserHistoryEntry(text: string): string | null {
-  const withoutPrefix = text.replace(/^\s*›\s*/, "").trim();
-  return withoutPrefix.length > 0 ? withoutPrefix : null;
-}
-
-function extractHistoryFromTranscript(lines: Array<{ type: string; text: string }>): string[] {
-  const seen = new Set<string>();
-  const history: string[] = [];
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i]!;
-    if (line.type !== "user") continue;
-    const normalized = normalizeUserHistoryEntry(line.text);
-    if (!normalized || seen.has(normalized)) continue;
-    seen.add(normalized);
-    history.push(normalized);
-    if (history.length >= MAX_HISTORY_ENTRIES) break;
-  }
-  return history;
-}
-
-interface ThinkingCollapsibleLineProps {
-  groupId: string;
-  lines: ContentLine[];
-  expanded: boolean;
-  isActive: boolean;
-  onToggle: () => void;
-  onFocusChange: (focused: boolean) => void;
-}
-
-function ThinkingCollapsibleLine({
-  groupId,
-  lines,
-  expanded,
-  isActive,
-  onToggle,
-  onFocusChange,
-}: ThinkingCollapsibleLineProps) {
-  const summarySource = useMemo(() => {
-    const firstContent = lines.find((line) => line.type === "thinking" && isCollapsibleThinkingLine(line.text));
-    return firstContent ?? lines[0];
-  }, [lines]);
-  const summaryLineText = summarySource?.text ?? "";
-  const { summary, full, truncated } = useMemo(() => summarizeThinking(summaryLineText), [summaryLineText]);
-
-  const { isFocused } = useFocus({
-    id: `thinking-${groupId}`,
-    isActive,
-  });
-
-  useEffect(() => {
-    onFocusChange(isFocused);
-  }, [isFocused, onFocusChange]);
-
-  useInput((input, key) => {
-    if (!isActive || !isFocused) return;
-    if (key.return || input === " ") {
-      onToggle();
-    }
-  }, { isActive: isActive && isFocused });
-
-  return (
-    <Box
-      flexDirection="column"
-      borderStyle="round"
-      borderColor={isFocused ? "yellow" : "gray"}
-      paddingX={1}
-    >
-      <Text color={isFocused ? "white" : "gray"}>{`${expanded ? "▼" : "▶"} ${summary}`}</Text>
-      {expanded ? (
-        <Box flexDirection="column">
-          {truncated ? <Text dimColor>{full}</Text> : null}
-          {lines
-            .filter((line) => line.id !== summarySource?.id)
-            .map((line) => (
-              <Text
-                key={line.id}
-                color={line.type === "tool" ? "cyan" : "gray"}
-                dimColor={line.type !== "tool"}
-              >
-                {line.text.trimStart()}
-              </Text>
-            ))}
-        </Box>
-      ) : null}
-    </Box>
-  );
-}
-
-interface InputPanelProps {
-  input: string;
-  inputResetKey: number;
-  statusDivider: string;
-  statusInfo: string;
-  suggestions: string[];
-  isActive: boolean;
-  inputDisabled: boolean;
-  isProcessing: boolean;
-  canSubmit: boolean;
-  onChange: (value: string) => void;
-  onSubmit: (value: string) => void;
-  onFocusChange: (focused: boolean) => void;
-  slashOptions: SlashQuickOption[];
-  slashSelectedIndex: number;
-  providerOptions: ProviderQuickOption[];
-  providerSelectedIndex: number;
-}
-
-function InputPanel({
-  input,
-  inputResetKey,
-  statusDivider,
-  statusInfo,
-  suggestions,
-  isActive,
-  inputDisabled,
-  isProcessing,
-  canSubmit,
-  onChange,
-  onSubmit,
-  onFocusChange,
-  slashOptions,
-  slashSelectedIndex,
-  providerOptions,
-  providerSelectedIndex,
-}: InputPanelProps) {
-  const { isFocused } = useFocus({
-    id: INPUT_FOCUS_ID,
-    autoFocus: true,
-    isActive,
-  });
-
-  useEffect(() => {
-    onFocusChange(isFocused);
-  }, [isFocused, onFocusChange]);
-
-  const commandColWidth = useMemo(() => {
-    const widths = slashOptions.map((opt) => stringWidth(opt.command));
-    return Math.max(0, ...widths, 10);
-  }, [slashOptions]);
-
-  const providerColWidth = useMemo(() => {
-    const widths = providerOptions.map((opt) => stringWidth(opt.label));
-    return Math.max(0, ...widths, 10);
-  }, [providerOptions]);
-
-  return (
-    <Box
-      flexDirection="column"
-      borderStyle="round"
-      borderColor={isFocused ? (isProcessing ? "yellow" : "cyan") : "gray"}
-      paddingX={1}
-      marginTop={1}
-    >
-      <Box>
-        <Text>🐝</Text>
-        <Text dimColor> › </Text>
-        <TextInput
-          key={`input-${inputResetKey}`}
-          defaultValue={input}
-          isDisabled={!isActive || !isFocused || inputDisabled}
-          suggestions={suggestions}
-          onChange={onChange}
-          onSubmit={canSubmit && isFocused ? onSubmit : undefined}
-        />
-      </Box>
-      {providerOptions.length > 0 ? (
-        <Box flexDirection="column" marginTop={1} paddingLeft={2}>
-          {providerOptions.map((opt, index) => {
-            const selected = index === providerSelectedIndex;
-            const pad = " ".repeat(Math.max(1, providerColWidth - stringWidth(opt.label) + 2));
-            return (
-              <Text key={opt.key} color={selected ? "cyan" : undefined} bold={selected}>
-                {`${opt.label}${pad}${opt.desc}`}
-              </Text>
-            );
-          })}
-          <Text dimColor>  ↑/↓ or Tab switch · Enter apply · Esc cancel</Text>
-        </Box>
-      ) : slashOptions.length > 0 ? (
-        <Box flexDirection="column" marginTop={1} paddingLeft={2}>
-          {slashOptions.map((opt, index) => {
-            const selected = index === slashSelectedIndex;
-            const pad = " ".repeat(Math.max(1, commandColWidth - stringWidth(opt.command) + 2));
-            return (
-              <Text key={opt.key} color={selected ? "cyan" : undefined} bold={selected}>
-                {`${opt.command}${pad}${opt.desc}`}
-              </Text>
-            );
-          })}
-          <Text dimColor>  ↑/↓ or Tab switch · Enter apply</Text>
-        </Box>
-      ) : null}
-      <Text dimColor>{`  ${statusDivider}`}</Text>
-      <Text dimColor>{`  ${statusInfo}`}</Text>
-    </Box>
-  );
-}
+import { extractHistoryFromTranscript, isCollapsibleThinkingLine, isGenericThinkingLine, rowsForText, summarizeThinking } from "./content.ts";
+import { InputPanel } from "./InputPanel.tsx";
+import { extractTerminalEvents } from "./terminal.ts";
+import { ThinkingCollapsibleLine } from "./ThinkingCollapsibleLine.tsx";
+import { ThinkingStatusLine } from "./ThinkingStatusLine.tsx";
+import type {
+  ContentLine,
+  MouseClickEvent,
+  ProviderPickerOptions,
+  ProviderQuickOption,
+  RenderItem,
+  SlashQuickOption,
+} from "./types.ts";
+import { INPUT_FOCUS_ID, MAX_HISTORY_ENTRIES, WELCOME_PANEL_ROWS } from "./types.ts";
+import { WelcomePanel } from "./WelcomePanel.tsx";
 
 export interface AppProps {
+  viewportEpoch: number;
   config: WorkspaceConfig;
   chatSession: ChatSession;
-  banner: string;
   initialStatus: string[];
   initialTranscript?: Array<{
     type: "user" | "assistant" | "tool" | "thinking" | "error";
@@ -398,9 +53,9 @@ export interface AppProps {
 // ─── App Component ──────────────────────────────────────────────────────────
 
 export function App({
+  viewportEpoch,
   config,
   chatSession,
-  banner,
   initialStatus,
   initialTranscript = [],
   onCommand,
@@ -411,6 +66,9 @@ export function App({
   const { exit } = useApp();
   const { focus, focusNext, focusPrevious } = useFocusManager();
   const { stdin, isRawModeSupported } = useStdin();
+  const { stdout, write: writeTerminal } = useStdout();
+  void viewportEpoch;
+  const mouseCaptureEnabled = process.env.BEE_ENABLE_MOUSE === "1";
   const initialInputHistory = useMemo(
     () => extractHistoryFromTranscript(initialTranscript),
     [initialTranscript]
@@ -419,13 +77,11 @@ export function App({
   // ── State ──────────────────────────────────────────────────────────────────
   const [lines, setLines] = useState<ContentLine[]>(() => {
     const initial: ContentLine[] = [];
-    for (const [i, line] of banner.split("\n").entries()) {
-      initial.push({ id: `banner-${i}`, text: line, type: "banner" });
-    }
     for (const [i, line] of initialStatus.entries()) {
       initial.push({ id: `status-${i}`, text: line, type: "system" });
     }
     for (const [i, line] of initialTranscript.entries()) {
+      if (line.type === "thinking" && isGenericThinkingLine(line.text)) continue;
       initial.push({ id: `resume-${i}`, text: line.text, type: line.type });
     }
     return initial;
@@ -452,6 +108,7 @@ export function App({
   const [slashQuickIndex, setSlashQuickIndex] = useState(0);
   const [slashQuickDismissed, setSlashQuickDismissed] = useState(false);
   const [expandedThinkingIds, setExpandedThinkingIds] = useState<Set<string>>(() => new Set());
+  const [activeThinkingLabel, setActiveThinkingLabel] = useState<string | null>(null);
   const mouseRemainderRef = useRef("");
   const cursorRowRef = useRef<number | null>(null);
 
@@ -485,6 +142,14 @@ export function App({
     () => renderItems.filter((item) => item.kind === "thinking-group").map((item) => item.id),
     [renderItems]
   );
+  const streamingThinkingGroupId = useMemo(() => {
+    if (!isProcessing) return null;
+    for (let i = renderItems.length - 1; i >= 0; i--) {
+      const item = renderItems[i]!;
+      if (item.kind === "thinking-group") return item.id;
+    }
+    return null;
+  }, [isProcessing, renderItems]);
 
 
   // ── Helpers ────────────────────────────────────────────────────────────────
@@ -516,9 +181,11 @@ export function App({
   const focusInput = useCallback(() => {
     setTimeout(() => {
       focus(INPUT_FOCUS_ID);
-      process.stdout.write("\u001b[6n");
+      if (mouseCaptureEnabled) {
+        writeTerminal("\u001b[6n");
+      }
     }, 0);
-  }, [focus]);
+  }, [focus, mouseCaptureEnabled, writeTerminal]);
 
   const toggleThinkingGroup = useCallback((groupId: string) => {
     setExpandedThinkingIds((prev) => {
@@ -653,12 +320,12 @@ export function App({
   }, [providerPicker]);
 
   const slashSuggestionHints = slashQuickOptions.map((opt) => opt.commandText);
-  const statusDivider = "─".repeat(Math.max(24, Math.min(96, statusInfo.length + 12)));
+  const statusDivider = "─".repeat(Math.max(8, Math.min(96, Math.min(statusInfo.length + 12, (stdout.columns ?? 80) - 8))));
 
   const clickLayout = useMemo(() => {
-    const termWidth = Math.max(20, process.stdout.columns ?? 80);
+    const termWidth = Math.max(20, stdout.columns ?? 80);
     const thinkingRanges: Array<{ id: string; start: number; end: number }> = [];
-    let row = 1;
+    let row = WELCOME_PANEL_ROWS + 1;
 
     for (const item of renderItems) {
       if (item.kind === "line") {
@@ -721,6 +388,7 @@ export function App({
     renderItems,
     slashQuickOptions.length,
     slashQuickOptionsVisible,
+    stdout.columns,
   ]);
 
   useEffect(() => {
@@ -911,12 +579,12 @@ export function App({
   }, [handleMouseClick]);
 
   useEffect(() => {
-    if (!isRawModeSupported || !stdin.isTTY) return;
+    if (!mouseCaptureEnabled || !isRawModeSupported || !stdin.isTTY) return;
 
     const enableMouse = "\u001b[?1000h\u001b[?1006h";
     const disableMouse = "\u001b[?1000l\u001b[?1006l";
-    process.stdout.write(enableMouse);
-    process.stdout.write("\u001b[6n");
+    writeTerminal(enableMouse);
+    writeTerminal("\u001b[6n");
     const originalRead = stdin.read.bind(stdin);
     const patchedRead = ((...args: unknown[]) => {
       const chunk = originalRead(...args as Parameters<typeof originalRead>);
@@ -941,10 +609,10 @@ export function App({
 
     return () => {
       (stdin as unknown as { read: typeof stdin.read }).read = originalRead;
-      process.stdout.write(disableMouse);
+      writeTerminal(disableMouse);
       mouseRemainderRef.current = "";
     };
-  }, [isRawModeSupported, stdin]);
+  }, [isRawModeSupported, mouseCaptureEnabled, stdin, writeTerminal]);
 
   // ── Submit handler ─────────────────────────────────────────────────────────
 
@@ -1006,6 +674,7 @@ export function App({
 
       if (cmd === "clear") {
         setLines([]);
+        setActiveThinkingLabel(null);
         focusInput();
         return;
       }
@@ -1016,6 +685,7 @@ export function App({
       }
 
       setIsProcessing(true);
+      setActiveThinkingLabel(null);
       await new Promise((resolve) => setTimeout(resolve, 0));
       let shouldExit = false;
       const output = await captureStream(async () => {
@@ -1043,6 +713,7 @@ export function App({
         text: string;
       }> = [{ type: "user", text: `  › ${trimmed}` }];
       setIsProcessing(true);
+      setActiveThinkingLabel(null);
       let responseBuffer = "";
       let assistantLineId: string | null = null;
       let lastThinking = "";
@@ -1050,21 +721,21 @@ export function App({
       const hooks: ChatRenderHooks = {
         onThinkingStart: (label) => {
           assistantLineId = null;
-          const line = `  🌻 ${label}`;
-          addLine(line, "thinking");
-          transcriptBatch.push({ type: "thinking", text: line });
+          setActiveThinkingLabel(label);
         },
         onThinking: (text) => {
           const note = text.trim();
           if (!note || note === lastThinking) return;
           assistantLineId = null;
           lastThinking = note;
+          setActiveThinkingLabel(null);
           const line = `  💭 ${note}`;
           addLine(line, "thinking");
           transcriptBatch.push({ type: "thinking", text: line });
         },
         onTool: (name, preview) => {
           assistantLineId = null;
+          setActiveThinkingLabel(null);
           const item = preview ? `${name} ${preview}` : name;
           const line = `  📖 ${item}`;
           addLine(line, "tool");
@@ -1072,11 +743,13 @@ export function App({
         },
         onToolSummary: (summary) => {
           assistantLineId = null;
+          setActiveThinkingLabel(null);
           const line = `  ${summary}`;
           addLine(line, "tool");
           transcriptBatch.push({ type: "tool", text: line });
         },
         onText: (text) => {
+          setActiveThinkingLabel(null);
           responseBuffer += text;
           if (!assistantLineId) {
             assistantLineId = nextLineId("assistant-stream");
@@ -1094,6 +767,7 @@ export function App({
         },
         onError: (text) => {
           assistantLineId = null;
+          setActiveThinkingLabel(null);
           const line = `  ${text}`;
           addLine(line, "error");
           transcriptBatch.push({ type: "error", text: line });
@@ -1109,6 +783,7 @@ export function App({
         transcriptBatch.push({ type: "assistant", text: responseBuffer });
       }
       await chatSession.appendTranscript(transcriptBatch);
+      setActiveThinkingLabel(null);
       setIsProcessing(false);
       focusInput();
     }
@@ -1246,6 +921,7 @@ export function App({
 
   return (
     <Box flexDirection="column">
+      <WelcomePanel provider={activeProvider} useRtk={config.use_rtk ?? false} />
       {/* All content lines */}
       {renderItems.map((item) => (
         item.kind === "thinking-group" ? (
@@ -1255,6 +931,7 @@ export function App({
             lines={item.lines}
             expanded={expandedThinkingIds.has(item.id)}
             isActive={!isExiting && !providerPicker && !slashQuickOptionsVisible}
+            isStreaming={isProcessing && streamingThinkingGroupId === item.id}
             onToggle={() => toggleThinkingGroup(item.id)}
             onFocusChange={(focused) => {
               if (focused) {
@@ -1282,6 +959,7 @@ export function App({
           </Text>
         )
       ))}
+      {!isExiting && activeThinkingLabel ? <ThinkingStatusLine label={activeThinkingLabel} /> : null}
 
       {!isExiting && (
         <InputPanel

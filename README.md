@@ -141,7 +141,7 @@ bee talks to agents via ACP (Agent Communication Protocol):
 Every execution emits:
 
 - `trace_id` — unique ID per task run
-- Structured logs → `/logs`
+- Structured logs → `/.bee/logs`
 - Token cost tracking per step
 - Full replay support for debugging
 
@@ -161,9 +161,7 @@ bee/
 │   ├── verifier/     # Verification gate
 │   ├── observability/# Tracing, cost, logs
 │   └── schema/       # Zod schemas
-├── state/            # Runtime task state
-├── logs/             # Execution logs
-└── specs/            # Task specs
+└── .bee/             # Local runtime data, config, tasks, state, logs
 ```
 
 ---
