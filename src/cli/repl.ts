@@ -177,17 +177,20 @@ export async function runRepl(
   iface: rl.Interface
 ): Promise<void> {
   // ── Layout MUST be initialised before the banner ───────────────────────────
-  // ReplLayout sets DECSTBM (scroll region = rows 1..rows-2).  If we print
-  // the banner BEFORE setting the scroll region the cursor ends up in the
-  // fixed-row area (separator / status), which causes every subsequent write
-  // (prompt echo, AI response, line-rewrite) to land in the wrong rows and
-  // become invisible or corrupt the fixed rows.
+  // ReplLayout sets DECSTBM (scroll region = rows 1..rows-3) and reserves
+  // 3 fixed rows at the bottom: separator + prompt + status.
+  // If we print the banner BEFORE setting the scroll region, the cursor ends
+  // up in the fixed-row area, making all subsequent writes invisible.
   const status = new StatusLine();
   const layout = new ReplLayout(status);
-  layout.init(); // ← reserve bottom 2 rows FIRST
+  layout.init(); // ← reserve bottom 3 rows FIRST
 
-  process.stdout.write(makeBanner(config.provider, config.use_rtk ?? false));
-  await showStatus(dirs);
+  // Banner + status go into the scroll region; track newlines for content cursor
+  const banner = makeBanner(config.provider, config.use_rtk ?? false);
+  process.stdout.write(banner);
+  layout.advanceContent((banner.match(/\n/g) || []).length);
+  const statusNl = await layout.trackWrites(() => showStatus(dirs));
+  layout.advanceContent(statusNl);
 
   const PROMPT = "🐝" + chalk.gray(" › ");
   iface.setPrompt(PROMPT);
@@ -206,15 +209,17 @@ export async function runRepl(
     try {
       while (_msgQueue.length > 0) {
         const msg = _msgQueue.shift()!;
-        await chatSession.send(msg);
+        // Write submitted line + AI response to the content area
+        layout.enterContent();
+        process.stdout.write(chalk.dim("  › " + msg) + "\n");
+        layout.advanceContent(1);
+        // Track newlines from the AI response for content cursor
+        const nl = await layout.trackWrites(() => chatSession.send(msg));
+        layout.advanceContent(nl);
       }
     } finally {
       _queueBusy = false;
-      // Redraw the prompt so readline's position tracking is correct
-      // after AI output potentially scrolled the terminal.
-      layout.refreshStatus();
-      iface.setPrompt(PROMPT);
-      iface.prompt();
+      showPrompt(); // return cursor to the fixed prompt row
     }
   }
 
@@ -313,11 +318,9 @@ export async function runRepl(
     }
   }
 
-  // ── Prompt with status header ─────────────────────────────────────────────
-  // Status lives in the fixed bottom row managed by ReplLayout.
-  // showPrompt() just refreshes that row and calls iface.prompt().
-  // No static text is written above the prompt, so readline's cursor tracking
-  // is never disturbed and the prompt naturally follows content down the screen.
+  // ── Prompt (always at the fixed row rows-1) ─────────────────────────────
+  // showPrompt() moves the cursor to the fixed prompt row, refreshes the
+  // status row, and calls iface.prompt().  The prompt never scrolls.
   function showPrompt(): void {
     const provider = chalk.cyan(config.provider);
     const model = chalk.dim(config.model ?? "default");
@@ -333,6 +336,7 @@ export async function runRepl(
     }
 
     layout.refreshStatus();
+    layout.enterPrompt(); // cursor → rows-1, clear line
     iface.setPrompt(PROMPT);
     iface.prompt();
   }
@@ -514,34 +518,30 @@ export async function runRepl(
       return;
     }
 
-    // Rewrite the readline-echoed prompt line as a styled history entry.
-    // readline already wrote: "🐝 › <input>\n" and moved to the next line.
-    // We go back one line, clear it, and replace with a clean gray "› message".
-    if (process.stdout.isTTY) {
-      const display = fullInput.includes("\n")
-        ? (fullInput.split("\n")[0] ?? "") + " ···"
-        : input;
-      process.stdout.write(`\x1b[A\x1b[2K${chalk.dim("  › " + display)}\n`);
-    }
-
     if (input.startsWith("!")) {
       // ── Shell escape: !command runs in the user's shell ──────────────────
       // Multi-line input (via Alt+Enter) is joined with \n so heredocs etc.
       // work as expected.
       const shellCmd = fullInput.replace(/^\s*!/, "");
       iface.pause();
+      layout.enterContent();
+      process.stdout.write(chalk.dim("  ! " + shellCmd) + "\n");
+      layout.advanceContent(1);
       try {
-        const proc = Bun.spawn(["sh", "-c", shellCmd], {
-          stdin: "inherit",
-          stdout: "inherit",
-          stderr: "inherit",
-          cwd: process.cwd(),
-          env: process.env,
+        const nl = await layout.trackWrites(async () => {
+          const proc = Bun.spawn(["sh", "-c", shellCmd], {
+            stdin: "inherit",
+            stdout: "inherit",
+            stderr: "inherit",
+            cwd: process.cwd(),
+            env: process.env,
+          });
+          await proc.exited;
+          if (proc.exitCode !== 0) {
+            process.stdout.write(chalk.dim(`  exit ${proc.exitCode}\n`));
+          }
         });
-        await proc.exited;
-        if (proc.exitCode !== 0) {
-          process.stdout.write(chalk.dim(`  exit ${proc.exitCode}\n`));
-        }
+        layout.advanceContent(nl);
       } catch (err) {
         console.error(chalk.red(`  Shell error: ${err}`));
       }
@@ -550,13 +550,19 @@ export async function runRepl(
     } else if (input.startsWith("/")) {
       // Slash commands: pause while running so readline doesn't interleave
       iface.pause();
+      layout.enterContent();
       const resolved = resolveCommand(input);
       const [cmd, ...args] = resolved.split(/\s+/);
-      const shouldExit = await handleCommand(cmd ?? "", args, config, dirs, chatSession);
-      if (shouldExit) {
-        iface.close();
-        return;
-      }
+      let didExit = false;
+      const nl = await layout.trackWrites(async () => {
+        const shouldExit = await handleCommand(cmd ?? "", args, config, dirs, chatSession);
+        if (shouldExit) {
+          didExit = true;
+          iface.close();
+        }
+      });
+      if (didExit) return;
+      layout.advanceContent(nl);
       iface.resume();
       showPrompt();
     } else {
@@ -914,7 +920,6 @@ async function handleCommand(
 
     case "clear":
       process.stdout.write("\x1b[2J\x1b[H");
-      process.stdout.write(makeBanner(config.provider, config.use_rtk ?? false));
       break;
 
     case "exit":
