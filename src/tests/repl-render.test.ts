@@ -91,6 +91,26 @@ function processLine(state: MlState, raw: string): string | null {
   return fullInput.trim() || null;
 }
 
+// ─── Shell escape routing (mirrors !-prefix logic in repl.ts) ─────────────────
+
+type InputRoute = "shell" | "slash" | "chat" | "empty";
+
+/**
+ * Determine how an input line would be routed in the REPL.
+ * Mirrors the if-chain in the "line" handler.
+ */
+function routeInput(fullInput: string): { route: InputRoute; shellCmd?: string } {
+  const input = fullInput.trim();
+  if (!input) return { route: "empty" };
+  if (input.startsWith("!")) {
+    // Shell escape: strip leading whitespace + "!" from the raw fullInput
+    const shellCmd = fullInput.replace(/^\s*!/, "");
+    return { route: "shell", shellCmd };
+  }
+  if (input.startsWith("/")) return { route: "slash" };
+  return { route: "chat" };
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 describe("status content formatting", () => {
@@ -150,6 +170,53 @@ describe("status content formatting", () => {
       provider: "claude", model: "default", messageCount: 0, mlBufferLen: 0,
     }));
     expect(s).not.toContain("lines");
+  });
+});
+
+// ─── Shell escape (!command) routing ─────────────────────────────────────────
+
+describe("shell escape (!command) routing", () => {
+  it("!ls routes to shell with cmd 'ls'", () => {
+    const r = routeInput("!ls");
+    expect(r.route).toBe("shell");
+    expect(r.shellCmd).toBe("ls");
+  });
+
+  it("!echo hello world preserves args", () => {
+    const r = routeInput("!echo hello world");
+    expect(r.route).toBe("shell");
+    expect(r.shellCmd).toBe("echo hello world");
+  });
+
+  it("multi-line shell command preserves newlines", () => {
+    const r = routeInput("!for i in 1 2 3; do\necho $i\ndone");
+    expect(r.route).toBe("shell");
+    expect(r.shellCmd).toBe("for i in 1 2 3; do\necho $i\ndone");
+  });
+
+  it("! alone (no command) still routes to shell with empty cmd", () => {
+    const r = routeInput("!");
+    expect(r.route).toBe("shell");
+    expect(r.shellCmd).toBe("");
+  });
+
+  it("leading spaces before ! are stripped from shellCmd", () => {
+    const r = routeInput("  !pwd");
+    expect(r.route).toBe("shell");
+    expect(r.shellCmd).toBe("pwd");
+  });
+
+  it("/help routes to slash, not shell", () => {
+    expect(routeInput("/help").route).toBe("slash");
+  });
+
+  it("plain text routes to chat", () => {
+    expect(routeInput("hello world").route).toBe("chat");
+  });
+
+  it("empty input routes to empty", () => {
+    expect(routeInput("").route).toBe("empty");
+    expect(routeInput("   ").route).toBe("empty");
   });
 });
 

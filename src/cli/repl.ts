@@ -524,7 +524,30 @@ export async function runRepl(
       process.stdout.write(`\x1b[A\x1b[2K${chalk.dim("  › " + display)}\n`);
     }
 
-    if (input.startsWith("/")) {
+    if (input.startsWith("!")) {
+      // ── Shell escape: !command runs in the user's shell ──────────────────
+      // Multi-line input (via Alt+Enter) is joined with \n so heredocs etc.
+      // work as expected.
+      const shellCmd = fullInput.replace(/^\s*!/, "");
+      iface.pause();
+      try {
+        const proc = Bun.spawn(["sh", "-c", shellCmd], {
+          stdin: "inherit",
+          stdout: "inherit",
+          stderr: "inherit",
+          cwd: process.cwd(),
+          env: process.env,
+        });
+        await proc.exited;
+        if (proc.exitCode !== 0) {
+          process.stdout.write(chalk.dim(`  exit ${proc.exitCode}\n`));
+        }
+      } catch (err) {
+        console.error(chalk.red(`  Shell error: ${err}`));
+      }
+      iface.resume();
+      showPrompt();
+    } else if (input.startsWith("/")) {
       // Slash commands: pause while running so readline doesn't interleave
       iface.pause();
       const resolved = resolveCommand(input);
