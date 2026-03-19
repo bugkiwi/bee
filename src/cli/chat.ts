@@ -1,6 +1,6 @@
 import chalk from "chalk";
 import type { WorkspaceConfig } from "../types/config.ts";
-import type { BeeSession } from "../session/manager.ts";
+import type { BeeSession, BeeTranscriptLine } from "../session/manager.ts";
 import { SessionManager } from "../session/manager.ts";
 
 // ─── Content block types ──────────────────────────────────────────────────────
@@ -59,17 +59,33 @@ export interface ToolTrackerStats {
   linesChanged: number;
 }
 
+interface ToolTrackerOptions {
+  write?: (text: string) => void;
+  onTool?: (name: string, preview: string) => void;
+  onSummary?: (summary: string) => void;
+}
+
 class ToolTracker {
   private calls: ToolCall[] = [];
   private _needsNewline = false; // true after a tool line (no trailing \n yet)
   private _linesChanged = 0;
 
+  constructor(private options: ToolTrackerOptions = {}) {}
+
+  private get _renderEnabled(): boolean {
+    return typeof this.options.write === "function";
+  }
+
+  private write(text: string): void {
+    if (this.options.write) this.options.write(text);
+  }
+
   get count(): number { return this.calls.length; }
 
   /** Call before writing any text — ensures text starts on fresh line after a tool. */
   beforeText(): void {
-    if (this._needsNewline) {
-      process.stdout.write("\n");
+    if (this._renderEnabled && this._needsNewline) {
+      this.write("\n");
       this._needsNewline = false;
     }
   }
@@ -78,6 +94,7 @@ class ToolTracker {
   track(name: string, args: Record<string, unknown>): void {
     const preview = toolPreview(name, args);
     this.calls.push({ name, preview });
+    this.options.onTool?.(name, preview);
 
     // Estimate lines changed from file-writing tools
     if (name === "Edit" && args.new_string)
@@ -85,21 +102,29 @@ class ToolTracker {
     else if (name === "Write" && args.content)
       this._linesChanged += String(args.content).split("\n").length;
 
-    const emoji = toolEmoji(name);
-    const line = `\n  ${emoji} ${chalk.cyan(name)}  ${chalk.dim(preview)}`;
-    process.stdout.write(line);
-    this._needsNewline = true;
+    if (this._renderEnabled) {
+      const emoji = toolEmoji(name);
+      const line = `\n  ${emoji} ${chalk.cyan(name)}  ${chalk.dim(preview)}`;
+      this.write(line);
+      this._needsNewline = true;
+    }
   }
 
   /** Finalize display: flush pending newline, print collapsed summary. */
   finish(): void {
-    if (this._needsNewline) {
-      process.stdout.write("\n");
+    if (this._renderEnabled && this._needsNewline) {
+      this.write("\n");
       this._needsNewline = false;
     }
     if (this.calls.length === 0) return;
+
+    const summary = `↳ ${this.calls.length} tool${this.calls.length !== 1 ? "s" : ""}`;
+    this.options.onSummary?.(summary);
+
+    if (!this._renderEnabled) return;
+
     const icons = this.calls.map(c => toolEmoji(c.name)).join(" ");
-    process.stdout.write(
+    this.write(
       chalk.dim(`\n  ↳ ${this.calls.length} tool${this.calls.length !== 1 ? "s" : ""}  ${icons}\n`)
     );
   }
@@ -172,11 +197,27 @@ export interface SessionStats {
   linesChanged: number;
 }
 
+export interface ChatRenderHooks {
+  onThinkingStart?: (label: string) => void;
+  onThinking?: (text: string) => void;
+  onTool?: (name: string, preview: string) => void;
+  onToolSummary?: (summary: string) => void;
+  onText?: (text: string) => void;
+  onError?: (text: string) => void;
+}
+
 export interface ChatOptions {
   /** Called with a message when the session starts working, null when done. */
   onStatusUpdate?: (message: string | null) => void;
   /** Project root path for session persistence. */
   projectPath?: string;
+}
+
+export interface InitSessionOptions {
+  /** Resume a specific bee session id. */
+  resumeSessionId?: string;
+  /** Resume the newest session in current project when no explicit id is given. */
+  resumeLatest?: boolean;
 }
 
 export class ChatSession {
@@ -213,6 +254,13 @@ export class ChatSession {
     this._codexSessionId = null;
     this._kimiSessionId = null;
     this._messageCount = 0;
+    if (this._beeSession) {
+      this._beeSession.messageCount = 0;
+      this._beeSession.transcript = [];
+      if (this._sessionManager) {
+        void this._sessionManager.resetConversation(this._beeSession);
+      }
+    }
   }
 
   /** Get the current bee session (if persisted). */
@@ -220,26 +268,81 @@ export class ChatSession {
     return this._beeSession;
   }
 
+  get transcript(): BeeTranscriptLine[] {
+    return this._beeSession?.transcript ?? [];
+  }
+
+  async appendTranscript(
+    lines: Array<Pick<BeeTranscriptLine, "type" | "text">>
+  ): Promise<void> {
+    if (!this._sessionManager || !this._beeSession || lines.length === 0) return;
+    const now = new Date().toISOString();
+    const stamped: BeeTranscriptLine[] = lines.map((line) => ({
+      type: line.type,
+      text: line.text,
+      at: now,
+    }));
+    await this._sessionManager.appendTranscript(this._beeSession, stamped);
+  }
+
+  /** Switch active provider for both runtime config and persisted bee session. */
+  async switchProvider(to: string): Promise<void> {
+    this.config.provider = to;
+    if (this._sessionManager && this._beeSession) {
+      await this._sessionManager.switchProvider(this._beeSession, to);
+      return;
+    }
+    if (this._beeSession) {
+      this._beeSession.activeProvider = to;
+    }
+  }
+
   /** Initialize or resume a persistent session. Call once after construction. */
-  async initSession(resumeSessionId?: string): Promise<BeeSession> {
+  async initSession(opts: InitSessionOptions = {}): Promise<BeeSession> {
+    const { resumeSessionId, resumeLatest = false } = opts;
     if (!this._sessionManager) {
       this._sessionManager = new SessionManager(this.opts.projectPath ?? process.cwd());
     }
+    let existing: BeeSession | null = null;
     if (resumeSessionId) {
-      const existing = await this._sessionManager.load(resumeSessionId);
-      if (existing) {
-        this._beeSession = existing;
-        // Restore native session IDs from persisted bindings
-        for (const [name, binding] of Object.entries(existing.providers)) {
-          if (binding.nativeId) {
-            if (name === "claude") this._claudeSessionId = binding.nativeId;
-            else if (name === "codex") this._codexSessionId = binding.nativeId;
-            else if (name === "kimi") this._kimiSessionId = binding.nativeId;
-          }
+      existing = await this._sessionManager.load(resumeSessionId);
+      if (!existing) {
+        const prefixMatches = (await this._sessionManager.list())
+          .filter((session) => session.id.startsWith(resumeSessionId));
+
+        if (prefixMatches.length === 1) {
+          existing = prefixMatches[0]!;
+        } else if (prefixMatches.length > 1) {
+          const sample = prefixMatches
+            .slice(0, 5)
+            .map((session) => session.id.slice(0, 12))
+            .join(", ");
+          throw new Error(
+            `Ambiguous session prefix "${resumeSessionId}" (${prefixMatches.length} matches: ${sample}${prefixMatches.length > 5 ? ", ..." : ""}). Use a longer id.`
+          );
+        } else {
+          throw new Error(`Session not found in current project: ${resumeSessionId}`);
         }
-        this._messageCount = existing.messageCount;
-        return existing;
       }
+    } else if (resumeLatest) {
+      existing = await this._sessionManager.loadLatest();
+    }
+
+    if (existing) {
+      this._beeSession = existing;
+      // Restore native session IDs from persisted bindings
+      for (const [name, binding] of Object.entries(existing.providers)) {
+        if (binding.nativeId) {
+          if (name === "claude") this._claudeSessionId = binding.nativeId;
+          else if (name === "codex") this._codexSessionId = binding.nativeId;
+          else if (name === "kimi") this._kimiSessionId = binding.nativeId;
+        }
+      }
+      this._messageCount = existing.messageCount;
+      if (existing.activeProvider) {
+        this.config.provider = existing.activeProvider;
+      }
+      return existing;
     }
     // Create new session
     this._beeSession = await this._sessionManager.create(this.config.provider);
@@ -268,27 +371,37 @@ export class ChatSession {
    * Send a user message to the configured provider and stream the response.
    * Uses provider-native session continuation — no prompt rebuilding.
    */
-  async send(userMessage: string): Promise<void> {
+  async send(userMessage: string, hooks?: ChatRenderHooks): Promise<void> {
+    const eventMode = Boolean(hooks);
     this._messageCount++;
     this.opts.onStatusUpdate?.("thinking…");
-    console.log(); // blank line before response
+    if (!eventMode) {
+      console.log(); // blank line before response
+    } else {
+      hooks?.onThinkingStart?.("thinking…");
+    }
 
     try {
       switch (this.config.provider) {
         case "claude":
-          await this.sendClaude(userMessage);
+          await this.sendClaude(userMessage, hooks);
           break;
         case "codex":
-          await this.sendCodex(userMessage);
+          await this.sendCodex(userMessage, hooks);
           break;
         case "kimi":
-          await this.sendKimi(userMessage);
+          await this.sendKimi(userMessage, hooks);
           break;
         default:
-          await this.sendClaude(userMessage);
+          await this.sendClaude(userMessage, hooks);
       }
     } catch (err) {
-      console.error(chalk.red(`  Error: ${String(err)}\n`));
+      const errorText = `Error: ${String(err)}`;
+      if (eventMode) {
+        hooks?.onError?.(errorText);
+      } else {
+        console.error(chalk.red(`  ${errorText}\n`));
+      }
       this._messageCount--;
       return;
     } finally {
@@ -300,7 +413,9 @@ export class ChatSession {
       void this._sessionManager.recordMessage(this._beeSession);
     }
 
-    console.log(); // blank line after response
+    if (!eventMode) {
+      console.log(); // blank line after response
+    }
   }
 
   // ── Claude ─────────────────────────────────────────────────────────────────
@@ -308,7 +423,7 @@ export class ChatSession {
   // First call: generates a UUID for the session.
   // Subsequent calls: --resume <session-id> continues the conversation.
 
-  private async sendClaude(userMessage: string): Promise<string> {
+  private async sendClaude(userMessage: string, hooks?: ChatRenderHooks): Promise<string> {
     const model = this.config.model ?? "claude-sonnet-4-6";
 
     // Allocate a native session ID on first call
@@ -317,9 +432,14 @@ export class ChatSession {
       this._claudeSessionId = crypto.randomUUID();
     }
 
-    const stopSpinner = startSpinner("thinking…");
+    const eventMode = Boolean(hooks);
+    const stopSpinner = eventMode ? (() => {}) : startSpinner("thinking…");
     let spinnerStopped = false;
-    const tracker = new ToolTracker();
+    const tracker = new ToolTracker({
+      write: eventMode ? undefined : (text) => process.stdout.write(text),
+      onTool: (name, preview) => hooks?.onTool?.(name, preview),
+      onSummary: (summary) => hooks?.onToolSummary?.(summary),
+    });
 
     // Build args: first message uses --session-id, subsequent use --resume
     const args = [
@@ -398,16 +518,25 @@ export class ChatSession {
             for (const block of ev.message!.content!) {
               if (block.type === "text" && block.text) {
                 tracker.beforeText();
-                process.stdout.write(block.text);
+                if (eventMode) {
+                  hooks?.onText?.(block.text);
+                } else {
+                  process.stdout.write(block.text);
+                }
                 fullText += block.text;
               } else if (block.type === "tool_use") {
                 tracker.track(block.name ?? "", block.input ?? {});
               } else if (block.type === "thinking") {
-                tracker.beforeText();
                 const excerpt = (block.thinking ?? "").trim().slice(0, 160);
-                process.stdout.write(
-                  chalk.dim(`\n  💭  ${excerpt}${excerpt.length === 160 ? "…" : ""}\n`)
-                );
+                if (!excerpt) continue;
+                if (eventMode) {
+                  hooks?.onThinking?.(excerpt);
+                } else {
+                  tracker.beforeText();
+                  process.stdout.write(
+                    chalk.dim(`\n  💭  ${excerpt}${excerpt.length === 160 ? "…" : ""}\n`)
+                  );
+                }
               }
             }
           } else if (ev.type === "tool_use") {
@@ -415,7 +544,11 @@ export class ChatSession {
             tracker.track(ev.name ?? "", ev.input ?? {});
           } else if (ev.type === "result" && ev.result && !fullText.trim()) {
             tracker.beforeText();
-            process.stdout.write(ev.result);
+            if (eventMode) {
+              hooks?.onText?.(ev.result);
+            } else {
+              process.stdout.write(ev.result);
+            }
             fullText = ev.result;
           }
         }
@@ -442,8 +575,9 @@ export class ChatSession {
   // ── Codex ──────────────────────────────────────────────────────────────────
   // Uses `codex resume <session-id> <prompt>` for continuation.
 
-  private async sendCodex(userMessage: string): Promise<string> {
-    const stopSpinner = startSpinner("thinking…");
+  private async sendCodex(userMessage: string, hooks?: ChatRenderHooks): Promise<string> {
+    const eventMode = Boolean(hooks);
+    const stopSpinner = eventMode ? (() => {}) : startSpinner("thinking…");
 
     let args: string[];
     if (this._codexSessionId) {
@@ -483,7 +617,10 @@ export class ChatSession {
     if (proc.exitCode !== 0 && stderrText.trim()) throw new Error(stderrText.trim());
 
     const trimmed = text.trim();
-    if (trimmed) process.stdout.write(trimmed);
+    if (trimmed) {
+      if (eventMode) hooks?.onText?.(trimmed);
+      else process.stdout.write(trimmed);
+    }
     return trimmed;
   }
 
@@ -492,8 +629,9 @@ export class ChatSession {
   // First call: let Kimi allocate a session, capture from output.
   // Subsequent calls: --session <id> resumes.
 
-  private async sendKimi(userMessage: string): Promise<string> {
-    const stopSpinner = startSpinner("thinking…");
+  private async sendKimi(userMessage: string, hooks?: ChatRenderHooks): Promise<string> {
+    const eventMode = Boolean(hooks);
+    const stopSpinner = eventMode ? (() => {}) : startSpinner("thinking…");
 
     const args = ["kimi", "--print", userMessage];
     if (this._kimiSessionId) {
@@ -518,7 +656,8 @@ export class ChatSession {
         const chunk = decoder.decode(value, { stream: true });
         if (!chunk) continue;
         if (firstChunk) { stopSpinner(); firstChunk = false; }
-        process.stdout.write(chunk);
+        if (eventMode) hooks?.onText?.(chunk);
+        else process.stdout.write(chunk);
         fullText += chunk;
       }
     } finally {

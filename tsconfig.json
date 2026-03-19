@@ -5,10 +5,11 @@
     "moduleResolution": "bundler",
     "strict": true,
     "noUncheckedIndexedAccess": true,
+    "jsx": "react-jsx",
     "paths": {
       "@/*": ["./src/*"]
     },
-    "types": ["bun-types"],
+    "types": ["bun-types", "@types/react"],
     "allowImportingTsExtensions": true,
     "noEmit": true
   },

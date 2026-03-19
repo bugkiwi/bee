@@ -16,11 +16,27 @@ export async function readJsonFile<T>(path: string): Promise<T> {
 
 export async function writeJsonFile(path: string, data: unknown): Promise<void> {
   await ensureDir(dirname(path));
-  const tmp = `${path}.tmp`;
-  await Bun.write(tmp, JSON.stringify(data, null, 2) + "\n");
-  // atomic rename
-  const { rename } = await import("node:fs/promises");
-  await rename(tmp, path);
+  // Use a unique tmp path to avoid collisions when the same target is written concurrently.
+  const tmp = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+  const payload = JSON.stringify(data, null, 2) + "\n";
+
+  const { rename, unlink } = await import("node:fs/promises");
+  let wroteTmp = false;
+  try {
+    await Bun.write(tmp, payload);
+    wroteTmp = true;
+    // atomic rename
+    await rename(tmp, path);
+  } catch (error) {
+    if (wroteTmp) {
+      try {
+        await unlink(tmp);
+      } catch {
+        // best-effort cleanup
+      }
+    }
+    throw error;
+  }
 }
 
 export async function appendJsonLine(path: string, data: unknown): Promise<void> {

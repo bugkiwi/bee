@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document defines the REQUIRED plugin architecture for CCC (Claude Code Controller)
+This document defines the REQUIRED plugin architecture for BEE
 when operating in API mode.
 
 CCC is NOT a simple LLM wrapper.

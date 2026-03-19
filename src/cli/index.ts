@@ -23,7 +23,7 @@ async function loadConfig(configPath: string): Promise<WorkspaceConfig> {
 
 export function buildCli(): Command {
   const program = new Command("bee")
-    .description("Claude Code Controller — deterministic coding agent orchestrator")
+    .description("BEE — deterministic coding agent orchestrator")
     .version("0.1.0");
 
   program

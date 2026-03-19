@@ -5,7 +5,7 @@
  *   ~/.bee/projects/-Users-gkiwi-Work-bee/sessions/<session-id>.json
  *
  * Each session binds to a provider's native conversation so we never rebuild
- * the full prompt.  Core fields only — no message history stored here.
+ * the full prompt. It also stores a lightweight transcript for UI resume.
  */
 
 import { join } from "node:path";
@@ -42,6 +42,14 @@ export interface BeeSession {
   providers: Record<string, ProviderBinding>;
   /** Total user messages sent in this session */
   messageCount: number;
+  /** Persisted chat transcript lines for session resume rendering. */
+  transcript: BeeTranscriptLine[];
+}
+
+export interface BeeTranscriptLine {
+  type: "user" | "assistant" | "tool" | "thinking" | "error";
+  text: string;
+  at: string;
 }
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
@@ -82,6 +90,16 @@ export class SessionManager {
     return join(this._sessionsDir, `${sessionId}.json`);
   }
 
+  private normalizeSessionShape(raw: BeeSession): BeeSession {
+    const transcript = Array.isArray((raw as Partial<BeeSession>).transcript)
+      ? (raw as Partial<BeeSession>).transcript as BeeTranscriptLine[]
+      : [];
+    return {
+      ...raw,
+      transcript,
+    };
+  }
+
   /** Create a new session and persist it. */
   async create(provider: string): Promise<BeeSession> {
     const now = new Date().toISOString();
@@ -101,6 +119,7 @@ export class SessionManager {
         },
       },
       messageCount: 0,
+      transcript: [],
     };
     await this.save(session);
     return session;
@@ -109,7 +128,8 @@ export class SessionManager {
   /** Load a session by ID. Returns null if not found. */
   async load(sessionId: string): Promise<BeeSession | null> {
     try {
-      return await readJsonFile<BeeSession>(this._sessionFile(sessionId));
+      const raw = await readJsonFile<BeeSession>(this._sessionFile(sessionId));
+      return this.normalizeSessionShape(raw);
     } catch {
       return null;
     }
@@ -123,7 +143,7 @@ export class SessionManager {
     let latest: BeeSession | null = null;
     for (const f of files) {
       try {
-        const s = await readJsonFile<BeeSession>(f);
+        const s = this.normalizeSessionShape(await readJsonFile<BeeSession>(f));
         if (!latest || s.updatedAt > latest.updatedAt) latest = s;
       } catch { /* skip corrupted */ }
     }
@@ -136,7 +156,7 @@ export class SessionManager {
     const sessions: BeeSession[] = [];
     for (const f of files) {
       try {
-        sessions.push(await readJsonFile<BeeSession>(f));
+        sessions.push(this.normalizeSessionShape(await readJsonFile<BeeSession>(f)));
       } catch { /* skip corrupted */ }
     }
     return sessions.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
@@ -194,6 +214,29 @@ export class SessionManager {
   /** Increment message count. */
   async recordMessage(session: BeeSession): Promise<void> {
     session.messageCount++;
+    await this.save(session);
+  }
+
+  /** Append transcript lines to a session and persist. */
+  async appendTranscript(session: BeeSession, lines: BeeTranscriptLine[]): Promise<void> {
+    if (lines.length === 0) return;
+    if (!Array.isArray(session.transcript)) session.transcript = [];
+    session.transcript.push(...lines);
+    const MAX_LINES = 2000;
+    if (session.transcript.length > MAX_LINES) {
+      session.transcript = session.transcript.slice(-MAX_LINES);
+    }
+    await this.save(session);
+  }
+
+  /** Reset conversation continuity for a session (history + native IDs + counters). */
+  async resetConversation(session: BeeSession): Promise<void> {
+    session.messageCount = 0;
+    session.transcript = [];
+    for (const provider of Object.values(session.providers)) {
+      provider.nativeId = null;
+      provider.lastActive = new Date().toISOString();
+    }
     await this.save(session);
   }
 

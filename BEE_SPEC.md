@@ -1,4 +1,4 @@
-# CCC (Claude Code Controller)
+# BEE
 
 ## 0. Overview
 

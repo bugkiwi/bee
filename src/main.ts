@@ -1,13 +1,18 @@
 #!/usr/bin/env bun
-import * as readline from "node:readline";
 import { buildCli } from "./cli/index.ts";
-import { runRepl } from "./cli/repl.ts";
+import { runRepl as runInkRepl } from "./cli/repl-ink.tsx";
 import { findWorkspaceRoot, getWorkspaceDirs } from "./utils/workspace.ts";
-import { readJsonFile, fileExists } from "./utils/fs.ts";
+import { readJsonFile, fileExists, writeJsonFile } from "./utils/fs.ts";
 import { DEFAULT_CONFIG, type WorkspaceConfig } from "./types/config.ts";
 import { WorkspaceConfigSchema } from "./schema/config.schema.ts";
-import { runFirstRunWizard } from "./cli/wizard.ts";
-import { buildCompleter } from "./cli/commands.ts";
+import { runFirstRunWizardInk } from "./cli/wizard-ink.tsx";
+
+interface InteractiveModeArgs {
+  isInteractive: boolean;
+  resumeSessionId?: string;
+  resumeLatest?: boolean;
+  error?: string;
+}
 
 async function loadConfig(configPath: string): Promise<WorkspaceConfig> {
   try {
@@ -19,35 +24,94 @@ async function loadConfig(configPath: string): Promise<WorkspaceConfig> {
   }
 }
 
+function canUseInkRepl(): boolean {
+  return Boolean(
+    process.stdin.isTTY &&
+    process.stdout.isTTY &&
+    typeof (process.stdin as NodeJS.ReadStream).setRawMode === "function"
+  );
+}
+
+function parseInteractiveModeArgs(args: string[]): InteractiveModeArgs {
+  if (args.length === 0) return { isInteractive: true };
+
+  let resumeSessionId: string | undefined;
+  let resumeLatest = false;
+  const passthroughArgs: string[] = [];
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--resume") {
+      const value = args[i + 1];
+      if (!value || value.startsWith("-")) {
+        resumeLatest = true;
+        continue;
+      }
+      resumeSessionId = value;
+      i++;
+      continue;
+    }
+
+    if (arg.startsWith("--resume=")) {
+      const value = arg.slice("--resume=".length);
+      if (!value) {
+        resumeLatest = true;
+        continue;
+      }
+      resumeSessionId = value;
+      continue;
+    }
+
+    passthroughArgs.push(arg);
+  }
+
+  if ((resumeSessionId || resumeLatest) && passthroughArgs.length > 0) {
+    return {
+      isInteractive: true,
+      error: "`--resume` only works in interactive mode. Usage: bee --resume [session-id]",
+    };
+  }
+
+  if (resumeSessionId || resumeLatest) {
+    return { isInteractive: true, resumeSessionId, resumeLatest };
+  }
+
+  return { isInteractive: false };
+}
+
 async function main() {
   const args = process.argv.slice(2);
+  const interactiveModeArgs = parseInteractiveModeArgs(args);
 
-  if (args.length === 0) {
+  if (interactiveModeArgs.isInteractive) {
+    if (interactiveModeArgs.error) {
+      throw new Error(interactiveModeArgs.error);
+    }
+
     const root = findWorkspaceRoot();
     const dirs = getWorkspaceDirs(root);
     let config = await loadConfig(dirs.config);
+    const supportsInk = canUseInkRepl();
 
-    // Create ONE readline interface shared by wizard → REPL
-    const iface = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-      completer: buildCompleter(),
-      terminal: process.stdin.isTTY ?? false,
-    });
-
-    // First-run wizard (TTY only; skip in piped/CI mode)
+    // First-run setup
     if (fileExists(dirs.config) && !config._initialized) {
-      if (process.stdin.isTTY) {
-        config = await runFirstRunWizard(config, dirs.config, iface);
-        // Reload saved config
-        config = await loadConfig(dirs.config);
+      if (supportsInk) {
+        config = await runFirstRunWizardInk(config, dirs.config);
       } else {
-        // Auto-initialize with defaults in non-TTY
-        config._initialized = true;
+        // Non-interactive path: initialize with defaults.
+        config = { ...config, _initialized: true };
+        await writeJsonFile(dirs.config, config);
       }
     }
 
-    await runRepl(config, dirs, iface);
+    if (!supportsInk) {
+      throw new Error("Interactive mode requires a TTY. Use subcommands like `bee run` in non-interactive environments.");
+    }
+
+    await runInkRepl(config, dirs, {
+      resumeSessionId: interactiveModeArgs.resumeSessionId,
+      resumeLatest: interactiveModeArgs.resumeLatest,
+    });
     return;
   }
 

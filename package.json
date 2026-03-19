@@ -1,7 +1,7 @@
 {
   "name": "bee",
   "version": "0.1.0",
-  "description": "Claude Code Controller — deterministic coding agent orchestrator",
+  "description": "BEE — deterministic coding agent orchestrator",
   "type": "module",
   "bin": {
     "bee": "./src/main.ts"
@@ -17,14 +17,19 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
+    "@inkjs/ui": "^2.0.0",
     "chalk": "^5.4.1",
     "cli-table3": "^0.6.5",
     "commander": "^12.1.0",
+    "ink": "^6.8.0",
+    "react": "^19.2.4",
     "zod": "^3.24.2"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
     "@types/bun": "latest",
+    "@types/react": "^19.2.14",
+    "react-devtools-core": "^7.0.1",
     "typescript": "^5.8.2"
   }
 }

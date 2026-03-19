@@ -103,22 +103,6 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   },
 ];
 
-export function buildCompleter() {
-  const names = SLASH_COMMANDS.map((c) => `/${c.name}`);
-  const aliases = SLASH_COMMANDS
-    .filter((c) => c.alias)
-    .map((c) => `/${c.alias}`);
-  const all = [...names, ...aliases];
-
-  return function completer(line: string): [string[], string] {
-    if (line.startsWith("/") || line === "/") {
-      const hits = all.filter((n) => n.startsWith(line));
-      return [hits.length ? hits : all, line];
-    }
-    return [[], line];
-  };
-}
-
 export function resolveCommand(input: string): string {
   // Strip leading slash
   const bare = input.startsWith("/") ? input.slice(1) : input;
