@@ -123,7 +123,7 @@ async function getStatusLines(dirs: { tasks: string; state: string }): Promise<s
   const loader = new TaskLoader(dirs.tasks);
   const tasks = await loader.loadAll();
   if (tasks.length === 0) {
-    return [chalk.gray('  No tasks yet — run /plan <spec-file> to create one.'), ""];
+    return [];
   }
   const counts: Record<string, number> = {};
   for (const task of tasks) {
@@ -567,6 +567,7 @@ export async function runRepl(
   const initialTranscript = chatSession.transcript.map((line) => ({
     type: line.type,
     text: line.text,
+    meta: line.meta,
   }));
 
   let viewportEpoch = 0;

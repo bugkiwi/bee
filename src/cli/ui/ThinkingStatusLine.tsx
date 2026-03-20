@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { Text } from "ink";
+import { Box, Text } from "ink";
+import { CONTENT_LABEL_GAP, CONTENT_LABEL_WIDTH } from "./content.ts";
 
 const THINKING_STATUS_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 
@@ -15,8 +16,17 @@ export function ThinkingStatusLine({ label }: { label: string }) {
   }, []);
 
   return (
-    <Text color="gray" wrap="truncate-end">
-      {`  ${THINKING_STATUS_FRAMES[frameIndex]} ${text}`}
-    </Text>
+    <Box width="100%">
+      <Box width={CONTENT_LABEL_WIDTH} marginRight={CONTENT_LABEL_GAP} flexShrink={0}>
+        <Text color="gray" dimColor>
+          THINKING
+        </Text>
+      </Box>
+      <Box flexGrow={1}>
+        <Text color="gray" wrap="truncate-end">
+          {`${THINKING_STATUS_FRAMES[frameIndex]} ${text}`}
+        </Text>
+      </Box>
+    </Box>
   );
 }

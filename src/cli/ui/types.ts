@@ -1,7 +1,12 @@
+import type { MetaGroupType } from "./content.ts";
+import type { TranscriptLineMeta } from "../../types/transcript.ts";
+
 export interface ContentLine {
   id: string;
   text: string;
   type: "user" | "assistant" | "system" | "tool" | "shell" | "error" | "thinking";
+  meta?: TranscriptLineMeta;
+  isFirstAssistantInTurn?: boolean;
 }
 
 export interface ProviderPickerOptions {
@@ -25,7 +30,7 @@ export interface ProviderQuickOption {
 
 export type RenderItem =
   | { kind: "line"; line: ContentLine }
-  | { kind: "thinking-group"; id: string; lines: ContentLine[] };
+  | { kind: "meta-group"; id: string; groupType: MetaGroupType; lines: ContentLine[] };
 
 export interface MouseClickEvent {
   x: number;

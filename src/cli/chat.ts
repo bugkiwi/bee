@@ -2,6 +2,8 @@ import chalk from "chalk";
 import type { WorkspaceConfig } from "../types/config.ts";
 import type { BeeSession, BeeTranscriptLine } from "../session/manager.ts";
 import { SessionManager } from "../session/manager.ts";
+import type { ToolDiffMeta } from "../types/transcript.ts";
+import { createToolDiffPreview } from "../utils/diff-preview.ts";
 
 // ─── Content block types ──────────────────────────────────────────────────────
 
@@ -62,6 +64,7 @@ export interface ToolTrackerStats {
 interface ToolTrackerOptions {
   write?: (text: string) => void;
   onTool?: (name: string, preview: string) => void;
+  onToolDiff?: (meta: ToolDiffMeta) => void;
   onSummary?: (summary: string) => void;
 }
 
@@ -93,8 +96,10 @@ class ToolTracker {
   /** Register a tool call and print it as its own line. */
   track(name: string, args: Record<string, unknown>): void {
     const preview = toolPreview(name, args);
+    const diffPreview = createToolDiffPreview(name, args);
     this.calls.push({ name, preview });
     this.options.onTool?.(name, preview);
+    if (diffPreview) this.options.onToolDiff?.(diffPreview);
 
     // Estimate lines changed from file-writing tools
     if (name === "Edit" && args.new_string)
@@ -201,6 +206,7 @@ export interface ChatRenderHooks {
   onThinkingStart?: (label: string) => void;
   onThinking?: (text: string) => void;
   onTool?: (name: string, preview: string) => void;
+  onToolDiff?: (meta: ToolDiffMeta) => void;
   onToolSummary?: (summary: string) => void;
   onText?: (text: string) => void;
   onError?: (text: string) => void;
@@ -273,13 +279,14 @@ export class ChatSession {
   }
 
   async appendTranscript(
-    lines: Array<Pick<BeeTranscriptLine, "type" | "text">>
+    lines: Array<Pick<BeeTranscriptLine, "type" | "text" | "meta">>
   ): Promise<void> {
     if (!this._sessionManager || !this._beeSession || lines.length === 0) return;
     const now = new Date().toISOString();
     const stamped: BeeTranscriptLine[] = lines.map((line) => ({
       type: line.type,
       text: line.text,
+      ...(line.meta ? { meta: line.meta } : {}),
       at: now,
     }));
     await this._sessionManager.appendTranscript(this._beeSession, stamped);
@@ -438,6 +445,7 @@ export class ChatSession {
     const tracker = new ToolTracker({
       write: eventMode ? undefined : (text) => process.stdout.write(text),
       onTool: (name, preview) => hooks?.onTool?.(name, preview),
+      onToolDiff: (meta) => hooks?.onToolDiff?.(meta),
       onSummary: (summary) => hooks?.onToolSummary?.(summary),
     });
 

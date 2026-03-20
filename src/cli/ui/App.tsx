@@ -15,17 +15,31 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import { clipboardImageSizeAsync, ensureScreenshotDir, saveClipboardImage } from "../screenshot.ts";
 import { Box, Text, useApp, useFocusManager, useInput, useStdin, useStdout } from "ink";
-import stringWidth from "string-width";
 import type { WorkspaceConfig } from "../../types/config.ts";
 import type { ChatSession, ChatRenderHooks } from "../chat.ts";
 import { SLASH_COMMANDS, resolveCommand } from "../commands.ts";
 import { resolveClickAction } from "./click-behavior.ts";
-import { extractHistoryFromTranscript, isCollapsibleThinkingLine, isGenericThinkingLine, rowsForText, summarizeThinking } from "./content.ts";
+import {
+  CONTENT_LABEL_GAP,
+  CONTENT_LABEL_WIDTH,
+  extractHistoryFromTranscript,
+  getCollapsibleMetaGroupType,
+  getContentBodyWidth,
+  getContentLineLabel,
+  getContentLineBlocks,
+  getContentLineText,
+  hasContentLineLeadingColumn,
+  getMetaSummaryLine,
+  isGenericThinkingLine,
+  rowsForBlock,
+  summarizeMetaGroup,
+} from "./content.ts";
 import { renderMarkdown } from "./markdown.ts";
 import { InputPanel } from "./InputPanel.tsx";
 import { extractTerminalEvents } from "./terminal.ts";
 import { ThinkingCollapsibleLine } from "./ThinkingCollapsibleLine.tsx";
 import { ThinkingStatusLine } from "./ThinkingStatusLine.tsx";
+import { summarizeToolDiff } from "../../utils/diff-preview.ts";
 import type {
   ContentLine,
   MouseClickEvent,
@@ -46,6 +60,7 @@ export interface AppProps {
   initialTranscript?: Array<{
     type: "user" | "assistant" | "tool" | "thinking" | "error";
     text: string;
+    meta?: ContentLine["meta"];
   }>;
   onCommand: (cmd: string, args: string[]) => Promise<boolean>;
   onProviderPickerRequest: () => Promise<ProviderPickerOptions>;
@@ -86,6 +101,7 @@ export function App({
     for (const [i, line] of initialTranscript.entries()) {
       if (line.type === "thinking" && isGenericThinkingLine(line.text)) continue;
       initial.push({ id: `resume-${i}`, text: line.text, type: line.type });
+      if (line.meta) initial[initial.length - 1]!.meta = line.meta;
     }
     return initial;
   });
@@ -117,6 +133,7 @@ export function App({
   const [slashQuickDismissed, setSlashQuickDismissed] = useState(false);
   const [expandedThinkingIds, setExpandedThinkingIds] = useState<Set<string>>(() => new Set());
   const [activeThinkingLabel, setActiveThinkingLabel] = useState<string | null>(null);
+  const [hasAssistantStream, setHasAssistantStream] = useState(false);
   const mouseRemainderRef = useRef("");
   const cursorRowRef = useRef<number | null>(null);
 
@@ -124,18 +141,20 @@ export function App({
     const items: RenderItem[] = [];
     for (let i = 0; i < lines.length;) {
       const line = lines[i]!;
-      if (line.type === "thinking" && isCollapsibleThinkingLine(line.text)) {
+      const groupType = getCollapsibleMetaGroupType(line);
+      if (groupType) {
         const grouped: ContentLine[] = [line];
         let j = i + 1;
         while (j < lines.length) {
           const next = lines[j]!;
-          if (next.type !== "thinking" && next.type !== "tool") break;
+          if (getCollapsibleMetaGroupType(next) !== groupType) break;
           grouped.push(next);
           j++;
         }
         items.push({
-          kind: "thinking-group",
-          id: `thinking-group-${line.id}`,
+          kind: "meta-group",
+          id: `meta-group-${line.id}`,
+          groupType,
           lines: grouped,
         });
         i = j;
@@ -147,32 +166,31 @@ export function App({
     return items;
   }, [lines]);
   const thinkingGroupIds = useMemo(
-    () => renderItems.filter((item) => item.kind === "thinking-group").map((item) => item.id),
+    () => renderItems.filter((item) => item.kind === "meta-group").map((item) => item.id),
     [renderItems]
   );
-  const streamingThinkingGroupId = useMemo(() => {
-    if (!isProcessing) return null;
-    for (let i = renderItems.length - 1; i >= 0; i--) {
-      const item = renderItems[i]!;
-      if (item.kind === "thinking-group") return item.id;
-    }
-    return null;
-  }, [isProcessing, renderItems]);
+  const streamingMetaGroupId = useMemo(() => {
+    if (!isProcessing || hasAssistantStream) return null;
+    const lastItem = renderItems[renderItems.length - 1];
+    if (!lastItem || lastItem.kind !== "meta-group") return null;
+    return lastItem.id;
+  }, [hasAssistantStream, isProcessing, renderItems]);
 
 
   // ── Helpers ────────────────────────────────────────────────────────────────
 
-  const addLine = useCallback((text: string, type: ContentLine["type"]) => {
-    setLines((prev) => [...prev, { id: nextLineId(type), text, type }]);
+  const addLine = useCallback((text: string, type: ContentLine["type"], meta?: ContentLine["meta"]) => {
+    setLines((prev) => [...prev, { id: nextLineId(type), text, type, ...(meta ? { meta } : {}) }]);
   }, [nextLineId]);
 
-  const addLines = useCallback((texts: string[], type: ContentLine["type"]) => {
+  const addLines = useCallback((texts: string[], type: ContentLine["type"], meta?: ContentLine["meta"]) => {
     setLines((prev) => [
       ...prev,
       ...texts.map((text) => ({
         id: nextLineId(type),
         text,
         type,
+        ...(meta ? { meta } : {}),
       })),
     ]);
   }, [nextLineId]);
@@ -352,30 +370,39 @@ export function App({
 
     for (const item of renderItems) {
       if (item.kind === "line") {
-        row += rowsForText(item.line.text, termWidth);
+        const bodyWidth = getContentBodyWidth(termWidth, hasContentLineLeadingColumn(item.line));
+        if (item.line.type === "assistant") {
+          row += rowsForBlock(renderMarkdown(item.line.text), bodyWidth);
+        } else {
+          for (const block of getContentLineBlocks(item.line)) {
+            row += rowsForBlock(block, bodyWidth);
+          }
+        }
         continue;
       }
 
       const lines = item.lines;
       const expanded = expandedThinkingIds.has(item.id);
-      const summarySource = lines.find((line) => line.type === "thinking" && isCollapsibleThinkingLine(line.text)) ?? lines[0];
-      const summaryLineText = summarySource?.text ?? "";
-      const { summary, full, truncated } = summarizeThinking(summaryLineText);
-      const innerWidth = Math.max(1, termWidth - 4);
+      const bodyWidth = getContentBodyWidth(termWidth, true);
+      const { summary, full, truncated, summarySource } = summarizeMetaGroup(lines);
+      const isStreamingGroup = isProcessing && streamingMetaGroupId === item.id;
 
       let h = 0;
-      h += 1; // border top
-      h += rowsForText(`${expanded ? "▼" : "▶"} ${summary}`, innerWidth);
+      h += rowsForBlock(
+        getMetaSummaryLine(summary, expanded, isStreamingGroup),
+        bodyWidth
+      );
 
       if (expanded) {
-        if (truncated) h += rowsForText(full, innerWidth);
+        h += 1;
+        if (truncated) h += rowsForBlock(full, bodyWidth);
         for (const line of lines) {
           if (line.id === summarySource?.id) continue;
-          h += rowsForText(line.text.trimStart(), innerWidth);
+          for (const block of getContentLineBlocks(line)) {
+            h += rowsForBlock(block, bodyWidth);
+          }
         }
       }
-
-      h += 1; // border bottom
 
       const start = row;
       const end = row + h - 1;
@@ -412,6 +439,8 @@ export function App({
     slashQuickOptions.length,
     slashQuickOptionsVisible,
     stdout.columns,
+    isProcessing,
+    streamingMetaGroupId,
   ]);
 
   useEffect(() => {
@@ -573,7 +602,7 @@ export function App({
       if (focusedThinkingId === targetThinking.id) {
         toggleThinkingGroup(targetThinking.id);
       } else {
-        focus(`thinking-${targetThinking.id}`);
+        focus(`meta-${targetThinking.id}`);
       }
       return;
     }
@@ -829,6 +858,7 @@ export function App({
         return;
       }
 
+      setHasAssistantStream(false);
       setIsProcessing(false);
       focusInput();
     } else {
@@ -845,22 +875,36 @@ export function App({
       const transcriptBatch: Array<{
         type: "user" | "assistant" | "tool" | "thinking" | "error";
         text: string;
+        meta?: ContentLine["meta"];
       }> = [{ type: "user", text: `  › ${trimmed}` }];
       setIsProcessing(true);
       setActiveThinkingLabel(null);
-      let responseBuffer = "";
+      setHasAssistantStream(false);
       let assistantLineId: string | null = null;
+      let assistantSegmentBuffer = "";
       let lastThinking = "";
+      let isFirstAssistantLine = true;
+      const finalizeAssistantSegment = () => {
+        if (!assistantLineId) {
+          assistantSegmentBuffer = "";
+          return;
+        }
+        if (assistantSegmentBuffer.trim()) {
+          transcriptBatch.push({ type: "assistant", text: assistantSegmentBuffer });
+        }
+        assistantLineId = null;
+        assistantSegmentBuffer = "";
+      };
 
       const hooks: ChatRenderHooks = {
         onThinkingStart: (label) => {
-          assistantLineId = null;
+          finalizeAssistantSegment();
           setActiveThinkingLabel(label);
         },
         onThinking: (text) => {
           const note = text.trim();
           if (!note || note === lastThinking) return;
-          assistantLineId = null;
+          finalizeAssistantSegment();
           lastThinking = note;
           setActiveThinkingLabel(null);
           const line = `  💭 ${note}`;
@@ -868,15 +912,22 @@ export function App({
           transcriptBatch.push({ type: "thinking", text: line });
         },
         onTool: (name, preview) => {
-          assistantLineId = null;
+          finalizeAssistantSegment();
           setActiveThinkingLabel(null);
           const item = preview ? `${name} ${preview}` : name;
           const line = `  📖 ${item}`;
           addLine(line, "tool");
           transcriptBatch.push({ type: "tool", text: line });
         },
+        onToolDiff: (meta) => {
+          finalizeAssistantSegment();
+          setActiveThinkingLabel(null);
+          const line = `  ${summarizeToolDiff(meta)}`;
+          addLine(line, "tool", meta);
+          transcriptBatch.push({ type: "tool", text: line, meta });
+        },
         onToolSummary: (summary) => {
-          assistantLineId = null;
+          finalizeAssistantSegment();
           setActiveThinkingLabel(null);
           const line = `  ${summary}`;
           addLine(line, "tool");
@@ -884,23 +935,27 @@ export function App({
         },
         onText: (text) => {
           setActiveThinkingLabel(null);
-          responseBuffer += text;
+          setHasAssistantStream(true);
+          assistantSegmentBuffer += text;
           if (!assistantLineId) {
             assistantLineId = nextLineId("assistant-stream");
+            const firstInTurn = isFirstAssistantLine;
+            isFirstAssistantLine = false;
             setLines((prev) => [
               ...prev,
               {
                 id: assistantLineId!,
-                text: responseBuffer,
+                text: assistantSegmentBuffer,
                 type: "assistant",
+                ...(firstInTurn ? { isFirstAssistantInTurn: true } : {}),
               },
             ]);
           } else {
-            updateLineById(assistantLineId, responseBuffer);
+            updateLineById(assistantLineId, assistantSegmentBuffer);
           }
         },
         onError: (text) => {
-          assistantLineId = null;
+          finalizeAssistantSegment();
           setActiveThinkingLabel(null);
           const line = `  ${text}`;
           addLine(line, "error");
@@ -910,14 +965,10 @@ export function App({
 
       await chatSession.send(message, hooks);
 
-      if (!assistantLineId && responseBuffer.trim()) {
-        addLines(responseBuffer.trimEnd().split("\n"), "assistant");
-      }
-      if (responseBuffer.trim()) {
-        transcriptBatch.push({ type: "assistant", text: responseBuffer });
-      }
+      finalizeAssistantSegment();
       await chatSession.appendTranscript(transcriptBatch);
       setActiveThinkingLabel(null);
+      setHasAssistantStream(false);
       setIsProcessing(false);
       focusInput();
     }
@@ -1053,19 +1104,82 @@ export function App({
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
+  const renderContentLine = (line: ContentLine) => {
+    const label = line.type === "assistant" && line.isFirstAssistantInTurn
+      ? "ANSWER"
+      : getContentLineLabel(line);
+    const bodyText = line.type === "assistant" ? renderMarkdown(line.text) : getContentLineText(line);
+    const bodyLines = bodyText.split("\n");
+    const hasLeadingColumn = hasContentLineLeadingColumn(line);
+
+    if (!hasLeadingColumn) {
+      return (
+        <Text
+          key={line.id}
+          dimColor={line.type === "shell"}
+          color={line.type === "error" ? "red" : undefined}
+        >
+          {bodyText}
+        </Text>
+      );
+    }
+
+    const labelColor =
+      line.type === "user"
+        ? "yellow"
+        : line.type === "error"
+          ? "red"
+          : line.type === "assistant"
+            ? undefined
+            : "gray";
+    const labelBold = line.type === "user" || line.type === "assistant" || line.type === "error";
+    const labelDim = line.type === "thinking" || line.type === "tool";
+    const bodyColor =
+      line.type === "error"
+        ? "red"
+        : line.type === "thinking"
+          ? "gray"
+          : line.type === "tool"
+            ? "cyan"
+            : undefined;
+    const bodyDim = line.type === "thinking" || line.type === "tool" || line.type === "shell";
+
+    return (
+      <Box key={line.id} width="100%" flexDirection="column">
+        {bodyLines.map((bodyLine, index) => (
+          <Box key={`${line.id}-${index}`} width="100%">
+            <Box width={CONTENT_LABEL_WIDTH} marginRight={CONTENT_LABEL_GAP} flexShrink={0}>
+              {index === 0 && label ? (
+                <Text color={labelColor} bold={labelBold} dimColor={labelDim}>
+                  {label}
+                </Text>
+              ) : null}
+            </Box>
+            <Box flexGrow={1}>
+              <Text color={bodyColor} dimColor={bodyDim}>
+                {bodyLine.length > 0 ? bodyLine : " "}
+              </Text>
+            </Box>
+          </Box>
+        ))}
+      </Box>
+    );
+  };
+
   return (
     <Box flexDirection="column">
       <WelcomePanel provider={activeProvider} useRtk={config.use_rtk ?? false} />
       {/* All content lines */}
       {renderItems.map((item) => (
-        item.kind === "thinking-group" ? (
+        item.kind === "meta-group" ? (
           <ThinkingCollapsibleLine
             key={item.id}
             groupId={item.id}
+            groupType={item.groupType}
             lines={item.lines}
             expanded={expandedThinkingIds.has(item.id)}
             isActive={!isExiting && !providerPicker && !slashQuickOptionsVisible}
-            isStreaming={isProcessing && streamingThinkingGroupId === item.id}
+            isStreaming={isProcessing && streamingMetaGroupId === item.id}
             onToggle={() => toggleThinkingGroup(item.id)}
             onFocusChange={(focused) => {
               if (focused) {
@@ -1075,23 +1189,7 @@ export function App({
               setFocusedThinkingId((prev) => (prev === item.id ? null : prev));
             }}
           />
-        ) : (
-          <Text
-            key={item.line.id}
-            dimColor={item.line.type === "user" || item.line.type === "shell"}
-            color={
-              item.line.type === "error"
-                ? "red"
-                : item.line.type === "tool"
-                  ? "cyan"
-                  : item.line.type === "thinking"
-                    ? "gray"
-                  : undefined
-            }
-          >
-            {item.line.type === "assistant" ? renderMarkdown(item.line.text) : item.line.text}
-          </Text>
-        )
+        ) : renderContentLine(item.line)
       ))}
       {!isExiting && activeThinkingLabel ? <ThinkingStatusLine label={activeThinkingLabel} /> : null}
 

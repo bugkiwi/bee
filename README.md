@@ -38,6 +38,9 @@ bun src/main.ts
 # Interactive REPL (no args = REPL mode)
 bee
 
+# Resume a previous session
+bee --resume <session-id>
+
 # Plan a task
 bee plan "implement user authentication"
 
@@ -53,6 +56,55 @@ bee verify
 # Replay past execution for debugging
 bee replay
 ```
+
+---
+
+## Interactive REPL
+
+Running `bee` with no arguments opens a full-featured terminal UI built with [Ink](https://github.com/vadimdemedes/ink) (React for the terminal).
+
+### UI Features
+
+- **Markdown rendering** — assistant responses render with full markdown formatting (bold, code blocks, lists, etc.)
+- **Diff previews** — tool calls that read/write/edit files show inline unified diffs with line counts
+- **Thinking blocks** — collapsible reasoning blocks; press `Enter` on a focused block to expand/collapse
+- **Tool tracking** — each tool call shows an emoji indicator and parameters at a glance
+- **Image paste** — `Ctrl+V` pastes clipboard images directly into the prompt
+- **Input history** — `↑`/`↓` to navigate previous prompts
+- **Auto-completion** — `/` commands complete with smart matching
+- **Mouse support** — click to focus, scroll history
+- **Status line** — shows active provider, model, session ID, and message count
+
+### Content Labels
+
+| Label | Color | Description |
+|---|---|---|
+| `ASK` | Yellow | Your prompt |
+| `ANSWER` | Default | Assistant response (markdown rendered) |
+| `THINKING` | Gray | Reasoning block (collapsible) |
+| `TOOL` | Cyan | Tool call with parameters and diff preview |
+| `ERROR` | Red | Error output |
+| `SYSTEM` | Dim | Status messages |
+
+### REPL Commands
+
+| Command | Description |
+|---|---|
+| `/plan <spec>` | Create a structured task from a spec file |
+| `/run [task-id]` | Execute a task with mandatory verification |
+| `/resume [task-id]` | Resume interrupted work |
+| `/verify <task-id>` | Run tests + lint + typecheck |
+| `/replay <task-id>` | Replay execution logs for debugging |
+| `/status`, `/tasks` | View task state |
+| `/provider` | List available providers |
+| `/switch <provider>` | Switch active provider |
+| `/session` | View session state, token costs, limit events |
+| `/config` | View workspace config |
+| `/logs [task-id]` | View execution logs |
+| `/gain` | Show token savings analytics (RTK) |
+| `/chat clear` | Reset chat history |
+| `/clear` | Clear terminal |
+| `!<command>` | Run a shell command |
 
 ---
 
@@ -90,6 +142,20 @@ All work is defined as a structured task:
 - No mid-task confirmation prompts
 - Verification (tests + lint + typecheck) is mandatory before `done`
 - Failures trigger automatic retry with backoff
+
+---
+
+## Session Persistence
+
+Sessions are stored globally at `~/.bee/projects/<path-hash>/sessions/<session-id>.json` and include:
+
+- **Provider bindings** — native session IDs for each provider (no context rebuilding between messages)
+- **Transcript** — lightweight chat history for UI resume
+- **Token usage and cost** per provider
+- **Limit events** — when providers hit rate limits
+- **Message count** and last active timestamp
+
+Provider session binding means Claude, Codex, and Kimi each own their conversation thread natively. Switching providers creates a new binding; resuming uses the stored native session ID.
 
 ---
 
@@ -152,14 +218,19 @@ Every execution emits:
 ```
 bee/
 ├── src/
-│   ├── cli/          # REPL, commands, wizard
+│   ├── cli/          # REPL, Ink UI components, commands
+│   │   └── ui/       # App.tsx, content rendering, types
 │   ├── agent/        # Agent loop
 │   ├── providers/    # Claude, Codex, Kimi adapters
 │   ├── plugins/      # Plugin registry and built-ins
 │   ├── tasks/        # Task contract engine
 │   ├── state/        # State machine + persistence
+│   ├── session/      # Session store and provider bindings
 │   ├── verifier/     # Verification gate
 │   ├── observability/# Tracing, cost, logs
+│   ├── types/        # Shared type definitions
+│   ├── utils/        # Diff preview, helpers
+│   ├── tests/        # Test suite
 │   └── schema/       # Zod schemas
 └── .bee/             # Local runtime data, config, tasks, state, logs
 ```
@@ -183,6 +254,7 @@ bun run build      # Compile to binary
 
 - **Runtime**: [Bun](https://bun.sh)
 - **Language**: TypeScript
+- **UI**: [Ink](https://github.com/vadimdemedes/ink) + React (terminal components)
 - **Validation**: [Zod](https://zod.dev)
 - **CLI**: [Commander](https://github.com/tj/commander.js)
 - **Linter**: [Biome](https://biomejs.dev)

@@ -11,6 +11,7 @@
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { ensureDir, readJsonFile, writeJsonFile, listFiles } from "../utils/fs.ts";
+import type { TranscriptLineMeta } from "../types/transcript.ts";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -49,6 +50,7 @@ export interface BeeSession {
 export interface BeeTranscriptLine {
   type: "user" | "assistant" | "tool" | "thinking" | "error";
   text: string;
+  meta?: TranscriptLineMeta;
   at: string;
 }
 
