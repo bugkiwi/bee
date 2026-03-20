@@ -21,6 +21,7 @@ import type { ChatSession, ChatRenderHooks } from "../chat.ts";
 import { SLASH_COMMANDS, resolveCommand } from "../commands.ts";
 import { resolveClickAction } from "./click-behavior.ts";
 import { extractHistoryFromTranscript, isCollapsibleThinkingLine, isGenericThinkingLine, rowsForText, summarizeThinking } from "./content.ts";
+import { renderMarkdown } from "./markdown.ts";
 import { InputPanel } from "./InputPanel.tsx";
 import { extractTerminalEvents } from "./terminal.ts";
 import { ThinkingCollapsibleLine } from "./ThinkingCollapsibleLine.tsx";
@@ -1088,7 +1089,7 @@ export function App({
                   : undefined
             }
           >
-            {item.line.text}
+            {item.line.type === "assistant" ? renderMarkdown(item.line.text) : item.line.text}
           </Text>
         )
       ))}
