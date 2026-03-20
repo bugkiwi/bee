@@ -10,6 +10,7 @@ export interface WorkspaceDirs {
   tasks: string;
   state: string;
   logs: string;
+  plans: string;
   config: string;
 }
 
@@ -52,6 +53,7 @@ export function getWorkspaceDirs(root: string): WorkspaceDirs {
     tasks: migrateLegacyRuntimeDir(root, bee, "tasks"),
     state: migrateLegacyRuntimeDir(root, bee, "state"),
     logs: migrateLegacyRuntimeDir(root, bee, "logs"),
+    plans: join(bee, "plans"),
     config: join(bee, "config.json"),
   };
 }

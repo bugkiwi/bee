@@ -76,11 +76,6 @@ export function StatusBar({ phase, label, terminalWidth }: StatusBarProps) {
 
   return (
     <Box flexDirection="column" width={terminalWidth}>
-      {/* Top separator */}
-      <Box>
-        <Text dimColor>{"─".repeat(terminalWidth)}</Text>
-      </Box>
-
       {/* Status row */}
       <Box>
         {/* Left anchor */}

@@ -10,6 +10,8 @@ import { runRun } from "./commands/run.ts";
 import { runResume } from "./commands/resume.ts";
 import { runVerify } from "./commands/verify.ts";
 import { runReplay } from "./commands/replay.ts";
+import { runSkeleton } from "./commands/skeleton.ts";
+import { runAsk } from "./commands/ask.ts";
 
 async function loadConfig(configPath: string): Promise<WorkspaceConfig> {
   try {
@@ -89,6 +91,32 @@ export function buildCli(): Command {
       const root = findWorkspaceRoot();
       const dirs = getWorkspaceDirs(root);
       await runReplay(dirs.logs, taskId, opts);
+    });
+
+  program
+    .command("skeleton <goal>")
+    .description("Generate and execute a skeleton plan for a high-level goal")
+    .option("--provider <name>", "Override provider")
+    .option("--pause", "Pause between nodes for confirmation")
+    .action(async (goal: string, opts: { provider?: string; pause?: boolean }) => {
+      const root = findWorkspaceRoot();
+      const dirs = getWorkspaceDirs(root);
+      const config = await loadConfig(dirs.config);
+      if (opts.provider) config.provider = opts.provider;
+      if (opts.pause) config.pause_between_nodes = true;
+      await runSkeleton(goal, config, dirs);
+    });
+
+  program
+    .command("ask <goal>")
+    .description("Recursively decompose and execute a goal (writes full plan to .bee/plans/)")
+    .option("--provider <name>", "Override provider")
+    .action(async (goal: string, opts: { provider?: string }) => {
+      const root = findWorkspaceRoot();
+      const dirs = getWorkspaceDirs(root);
+      const config = await loadConfig(dirs.config);
+      if (opts.provider) config.provider = opts.provider;
+      await runAsk(goal, config, dirs);
     });
 
   return program;

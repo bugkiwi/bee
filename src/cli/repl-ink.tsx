@@ -17,6 +17,7 @@ import { ProviderRegistry } from "../providers/registry.ts";
 import { Verifier } from "../verifier/index.ts";
 import { VerificationReporter } from "../verifier/reporter.ts";
 import { runPlan } from "./commands/plan.ts";
+import { runAsk } from "./commands/ask.ts";
 import { readJsonLines, listFiles, writeJsonFile } from "../utils/fs.ts";
 import type { TraceEvent } from "../types/observability.ts";
 import { printTaskTable, colorStatus } from "./output.ts";
@@ -247,7 +248,7 @@ async function handleCommand(
   cmd: string,
   args: string[],
   config: WorkspaceConfig,
-  dirs: { tasks: string; state: string; logs: string; config: string },
+  dirs: { tasks: string; state: string; logs: string; plans: string; config: string },
   chat: ChatSession
 ): Promise<boolean> {
   switch (cmd) {
@@ -349,6 +350,19 @@ async function handleCommand(
       await runPlan(specFile, dirs.tasks, {
         provider: providerArg ?? config.provider,
       });
+      break;
+    }
+
+    case "ask": {
+      // Triggered by planning intent detection — always auto-confirms
+      const goal = args.join(" ").trim();
+      if (!goal) break;
+      await runAsk(goal, config, {
+        tasks: dirs.tasks,
+        state: dirs.state,
+        logs: dirs.logs,
+        plans: dirs.plans,
+      }, { autoConfirm: true });
       break;
     }
 
@@ -550,7 +564,7 @@ async function handleCommand(
 
 export async function runRepl(
   config: WorkspaceConfig,
-  dirs: { tasks: string; state: string; logs: string; config: string },
+  dirs: { tasks: string; state: string; logs: string; plans: string; config: string },
   opts: { resumeSessionId?: string; resumeLatest?: boolean; showIntro?: boolean } = {}
 ): Promise<void> {
   const renderStream = process.stderr.isTTY ? process.stderr : process.stdout;

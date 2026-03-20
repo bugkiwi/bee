@@ -36,10 +36,12 @@ import {
   toInlineSummaryText,
 } from "./content.ts";
 import { renderMarkdown } from "./markdown.ts";
+import { stripAnsi } from "../../utils/strip-ansi.ts";
 import { InputPanel } from "./InputPanel.tsx";
 import { extractTerminalEvents } from "./terminal.ts";
 import { ThinkingCollapsibleLine } from "./ThinkingCollapsibleLine.tsx";
 import { StatusBar, type StatusPhase } from "./StatusBar.tsx";
+import { detectPlanningIntent } from "../../utils/intent.ts";
 import { summarizeToolDiff } from "../../utils/diff-preview.ts";
 import type {
   ContentLine,
@@ -548,7 +550,7 @@ export function App({
     });
 
     if (output.trim()) {
-      addLines(output.trimEnd().split("\n"), "system");
+      addLines(stripAnsi(output.trimEnd()).split("\n"), "system");
     }
 
     setActiveProvider(config.provider);
@@ -862,7 +864,7 @@ export function App({
       });
 
       if (output.trim()) {
-        addLines(output.trimEnd().split("\n"), "system");
+        addLines(stripAnsi(output.trimEnd()).split("\n"), "system");
       }
 
       setActiveProvider(config.provider);
@@ -873,6 +875,21 @@ export function App({
       }
 
       setHasAssistantStream(false);
+      setIsProcessing(false);
+      focusInput();
+    } else if (detectPlanningIntent(trimmed)) {
+      // ── Planning intent detected ──────────────────────────────────────
+      // Route to the ask flow: decompose → plan → execute
+      addLine(`  › ${trimmed}`, "user");
+      setIsProcessing(true);
+      setActiveThinkingLabel(null);
+      const output = await captureStream(async () => {
+        await onCommand("ask", trimmed.split(/\s+/));
+      });
+      if (output.trim()) {
+        addLines(stripAnsi(output.trimEnd()).split("\n"), "system");
+      }
+      setActiveProvider(config.provider);
       setIsProcessing(false);
       focusInput();
     } else {

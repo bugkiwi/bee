@@ -19,6 +19,8 @@ export interface WorkspaceConfig {
   kimi_api_key?: string;
   kimi_model?: string;
   kimi_base_url?: string;
+  // Skeleton: pause between nodes for user confirmation
+  pause_between_nodes?: boolean;
 }
 
 export const DEFAULT_CONFIG: WorkspaceConfig = {
