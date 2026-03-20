@@ -6,15 +6,21 @@ export const CONTENT_LABEL_WIDTH = 9;
 export const CONTENT_LABEL_GAP = 2;
 export type MetaGroupType = "thinking" | "tool";
 
+export function toInlineSummaryText(text: string): string {
+  return text.replace(/\s*\r?\n\s*/g, " ").replace(/[^\S\r\n]+/g, " ").trim();
+}
+
 export function summarizeThinking(text: string): { summary: string; full: string; truncated: boolean } {
   const full = text.trimStart();
-  if (full.length <= THINKING_SUMMARY_MAX) {
-    return { summary: full, full, truncated: false };
+  const summarySource = toInlineSummaryText(full);
+  const truncated = summarySource !== full || summarySource.length > THINKING_SUMMARY_MAX;
+  if (summarySource.length <= THINKING_SUMMARY_MAX) {
+    return { summary: summarySource, full, truncated };
   }
   return {
-    summary: `${full.slice(0, THINKING_SUMMARY_MAX)}…`,
+    summary: `${summarySource.slice(0, THINKING_SUMMARY_MAX)}…`,
     full,
-    truncated: true,
+    truncated,
   };
 }
 

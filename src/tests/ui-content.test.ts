@@ -7,6 +7,7 @@ import {
   hasContentLineLeadingColumn,
   rowsForBlock,
   summarizeMetaGroup,
+  toInlineSummaryText,
 } from "../cli/ui/content.ts";
 
 describe("ui content helpers", () => {
@@ -30,6 +31,20 @@ describe("ui content helpers", () => {
 
     expect(summarySource?.id).toBe("tool-1");
     expect(summary).toBe("search src/cli/ui");
+  });
+
+  it("collapses multiline meta summaries into a single line", () => {
+    const { summary, full, truncated } = summarizeMetaGroup([
+      { id: "think-1", type: "thinking", text: "  💭 plan:\n\n1. add StatusBar\n2. wire App" },
+    ]);
+
+    expect(summary).toBe("plan: 1. add StatusBar 2. wire App");
+    expect(full).toBe("plan:\n\n1. add StatusBar\n2. wire App");
+    expect(truncated).toBe(true);
+  });
+
+  it("normalizes inline status labels", () => {
+    expect(toInlineSummaryText("  planning\n  next\t step  ")).toBe("planning next step");
   });
 
   it("counts wrapped rows across newline-separated blocks", () => {

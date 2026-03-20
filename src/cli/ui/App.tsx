@@ -33,12 +33,13 @@ import {
   isGenericThinkingLine,
   rowsForBlock,
   summarizeMetaGroup,
+  toInlineSummaryText,
 } from "./content.ts";
 import { renderMarkdown } from "./markdown.ts";
 import { InputPanel } from "./InputPanel.tsx";
 import { extractTerminalEvents } from "./terminal.ts";
 import { ThinkingCollapsibleLine } from "./ThinkingCollapsibleLine.tsx";
-import { ThinkingStatusLine } from "./ThinkingStatusLine.tsx";
+import { StatusBar, type StatusPhase } from "./StatusBar.tsx";
 import { summarizeToolDiff } from "../../utils/diff-preview.ts";
 import type {
   ContentLine,
@@ -175,6 +176,19 @@ export function App({
     if (!lastItem || lastItem.kind !== "meta-group") return null;
     return lastItem.id;
   }, [hasAssistantStream, isProcessing, renderItems]);
+
+  const globalStatus = useMemo((): { phase: StatusPhase; label: string } | null => {
+    if (!isProcessing) return null;
+    if (hasAssistantStream) return { phase: "responding", label: "" };
+    if (activeThinkingLabel) return { phase: "thinking", label: toInlineSummaryText(activeThinkingLabel) };
+    if (streamingMetaGroupId) {
+      const group = renderItems.find((i) => i.kind === "meta-group" && i.id === streamingMetaGroupId);
+      if (group?.kind === "meta-group") {
+        return { phase: "tool", label: summarizeMetaGroup(group.lines).summary };
+      }
+    }
+    return { phase: "thinking", label: "" };
+  }, [isProcessing, hasAssistantStream, activeThinkingLabel, streamingMetaGroupId, renderItems]);
 
 
   // ── Helpers ────────────────────────────────────────────────────────────────
@@ -1191,7 +1205,13 @@ export function App({
           />
         ) : renderContentLine(item.line)
       ))}
-      {!isExiting && activeThinkingLabel ? <ThinkingStatusLine label={activeThinkingLabel} /> : null}
+      {!isExiting && globalStatus ? (
+        <StatusBar
+          phase={globalStatus.phase}
+          label={globalStatus.label}
+          terminalWidth={Math.max(20, stdout.columns ?? 80)}
+        />
+      ) : null}
 
       {!isExiting && (
         <InputPanel
