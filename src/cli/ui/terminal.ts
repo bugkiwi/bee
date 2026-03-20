@@ -21,6 +21,7 @@ export function exitAlternateScreen(target: WriteStream = process.stdout): void 
 export function extractTerminalEvents(data: string, remainder = ""): TerminalExtractResult {
   const input = remainder + data;
   const clicks: TerminalExtractResult["clicks"] = [];
+  const scrolls: TerminalExtractResult["scrolls"] = [];
   const cursorReports: TerminalExtractResult["cursorReports"] = [];
   const cleanParts: string[] = [];
   let i = 0;
@@ -56,6 +57,14 @@ export function extractTerminalEvents(data: string, remainder = ""): TerminalExt
             meta: (rawCode & 8) !== 0,
             ctrl: (rawCode & 16) !== 0,
           });
+        } else if (!isMotion && isWheel) {
+          scrolls.push({
+            x,
+            y,
+            direction: button === 0 ? "up" : "down",
+            ctrl: (rawCode & 16) !== 0,
+            shift: (rawCode & 4) !== 0,
+          });
         }
       }
       continue;
@@ -78,6 +87,7 @@ export function extractTerminalEvents(data: string, remainder = ""): TerminalExt
       return {
         clean: cleanParts.join(""),
         clicks,
+        scrolls,
         cursorReports,
         remainder: rest,
       };
@@ -90,6 +100,7 @@ export function extractTerminalEvents(data: string, remainder = ""): TerminalExt
   return {
     clean: cleanParts.join(""),
     clicks,
+    scrolls,
     cursorReports,
     remainder: "",
   };

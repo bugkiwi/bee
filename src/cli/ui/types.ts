@@ -35,6 +35,14 @@ export interface MouseClickEvent {
   meta: boolean;
 }
 
+export interface MouseScrollEvent {
+  x: number;
+  y: number;
+  direction: "up" | "down";
+  ctrl: boolean;
+  shift: boolean;
+}
+
 export interface CursorReport {
   row: number;
   col: number;
@@ -43,6 +51,7 @@ export interface CursorReport {
 export interface TerminalExtractResult {
   clean: string;
   clicks: MouseClickEvent[];
+  scrolls: MouseScrollEvent[];
   cursorReports: CursorReport[];
   remainder: string;
 }

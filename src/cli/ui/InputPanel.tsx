@@ -15,6 +15,7 @@ interface InputPanelProps {
   inputDisabled: boolean;
   isProcessing: boolean;
   canSubmit: boolean;
+  imageHint?: boolean;
   onChange: (value: string) => void;
   onSubmit: (value: string) => void;
   onFocusChange: (focused: boolean) => void;
@@ -34,6 +35,7 @@ export function InputPanel({
   inputDisabled,
   isProcessing,
   canSubmit,
+  imageHint,
   onChange,
   onSubmit,
   onFocusChange,
@@ -118,7 +120,7 @@ export function InputPanel({
         </Box>
       ) : null}
       <Text dimColor wrap="truncate-end">{dividerText}</Text>
-      <Text dimColor>{`  ${statusInfo}`}</Text>
+      <Text dimColor>{imageHint ? "  Image in clipboard · ctrl+v to paste" : `  ${statusInfo}`}</Text>
     </Box>
   );
 }

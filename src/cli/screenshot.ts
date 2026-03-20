@@ -8,13 +8,7 @@ export function ensureScreenshotDir(): void {
   mkdirSync(SCREENSHOT_DIR, { recursive: true });
 }
 
-/**
- * Returns the byte-size of the PNG in the clipboard, or 0 if none.
- * Fast: reads only clipboard metadata via osascript, no image data.
- */
-export function clipboardImageSize(): number {
-  if (process.platform !== "darwin") return 0;
-  const r = spawnSync("osascript", ["-e", `
+const CLIPBOARD_SIZE_SCRIPT = `
 try
   set info to clipboard info
   repeat with entry in info
@@ -25,8 +19,33 @@ try
   return "0"
 on error
   return "0"
-end try`], { encoding: "utf8", timeout: 800 });
+end try`;
+
+/**
+ * Returns the byte-size of the PNG in the clipboard, or 0 if none.
+ * Sync version — only use for one-time baseline checks (blocks event loop).
+ */
+export function clipboardImageSize(): number {
+  if (process.platform !== "darwin") return 0;
+  const r = spawnSync("osascript", ["-e", CLIPBOARD_SIZE_SCRIPT], { encoding: "utf8", timeout: 800 });
   return parseInt(r.stdout?.trim() ?? "0", 10) || 0;
+}
+
+/**
+ * Async version of clipboardImageSize — does not block the event loop.
+ */
+export async function clipboardImageSizeAsync(): Promise<number> {
+  if (process.platform !== "darwin") return 0;
+  try {
+    const proc = Bun.spawn(["osascript", "-e", CLIPBOARD_SIZE_SCRIPT], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const text = await new Response(proc.stdout).text();
+    return parseInt(text.trim(), 10) || 0;
+  } catch {
+    return 0;
+  }
 }
 
 /**

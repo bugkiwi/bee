@@ -13,6 +13,7 @@
  */
 
 import { useState, useCallback, useEffect, useRef, useMemo } from "react";
+import { clipboardImageSizeAsync, ensureScreenshotDir, saveClipboardImage } from "../screenshot.ts";
 import { Box, Text, useApp, useFocusManager, useInput, useStdin, useStdout } from "ink";
 import stringWidth from "string-width";
 import type { WorkspaceConfig } from "../../types/config.ts";
@@ -27,6 +28,7 @@ import { ThinkingStatusLine } from "./ThinkingStatusLine.tsx";
 import type {
   ContentLine,
   MouseClickEvent,
+  MouseScrollEvent,
   ProviderPickerOptions,
   ProviderQuickOption,
   RenderItem,
@@ -68,7 +70,7 @@ export function App({
   const { stdin, isRawModeSupported } = useStdin();
   const { stdout, write: writeTerminal } = useStdout();
   void viewportEpoch;
-  const mouseCaptureEnabled = process.env.BEE_ENABLE_MOUSE === "1";
+  const mouseCaptureEnabled = process.env.BEE_ENABLE_MOUSE !== "0";
   const initialInputHistory = useMemo(
     () => extractHistoryFromTranscript(initialTranscript),
     [initialTranscript]
@@ -95,6 +97,11 @@ export function App({
 
   const [input, setInput] = useState("");
   const [inputResetKey, setInputResetKey] = useState(0);
+  const [imageHint, setImageHint] = useState(false);
+  const pendingClipImageRef = useRef(false);
+  const imageSeqRef = useRef(0);
+  const imageMapRef = useRef(new Map<string, string>());
+  const inputRef = useRef(input);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isExiting, setIsExiting] = useState(false);
   const [activeProvider, setActiveProvider] = useState(config.provider);
@@ -177,6 +184,21 @@ export function App({
     setInput(next);
     setInputResetKey((prev) => prev + 1);
   }, []);
+
+  useEffect(() => { inputRef.current = input; }, [input]);
+
+  const handleClipboardPaste = useCallback(() => {
+    imageSeqRef.current++;
+    const placeholder = `[Image #${imageSeqRef.current}]`;
+    pendingClipImageRef.current = false;
+    setImageHint(false);
+    replaceInput(inputRef.current + placeholder);
+    void saveClipboardImage().then((filePath) => {
+      if (filePath) imageMapRef.current.set(placeholder, filePath);
+    });
+  }, [replaceInput]);
+  const handleClipboardPasteRef = useRef(handleClipboardPaste);
+  useEffect(() => { handleClipboardPasteRef.current = handleClipboardPaste; }, [handleClipboardPaste]);
 
   const focusInput = useCallback(() => {
     setTimeout(() => {
@@ -578,6 +600,69 @@ export function App({
     handleMouseClickRef.current = handleMouseClick;
   }, [handleMouseClick]);
 
+  const handleMouseScroll = useCallback((event: MouseScrollEvent) => {
+    if (isExiting || isProcessing || !inputFocused) return;
+
+    const cursorRow = cursorRowRef.current;
+    if (cursorRow !== null) {
+      const appTopRow = cursorRow - clickLayout.inputCursorRow + 1;
+      const relativeRow = event.y - appTopRow + 1;
+      const inInputArea = relativeRow >= clickLayout.inputStart && relativeRow <= clickLayout.inputEnd;
+
+      if (!inInputArea) {
+        // Scroll outside input: scroll terminal viewport content
+        writeTerminal(event.direction === "up" ? "\x1b[1T" : "\x1b[1S");
+        return;
+      }
+    }
+
+    // Scroll inside input (or unknown position): history navigation
+    if (providerPicker || slashQuickOptionsVisible) return;
+
+    if (event.direction === "up") {
+      if (historyIdx === -1 && history.length > 0) {
+        setSavedInput(input);
+        setHistoryIdx(0);
+        replaceInput(history[0]!);
+      } else if (historyIdx >= 0 && historyIdx < history.length - 1) {
+        const next = historyIdx + 1;
+        setHistoryIdx(next);
+        replaceInput(history[next]!);
+      }
+    } else {
+      if (historyIdx > 0) {
+        const next = historyIdx - 1;
+        setHistoryIdx(next);
+        replaceInput(history[next]!);
+      } else if (historyIdx === 0) {
+        setHistoryIdx(-1);
+        replaceInput(savedInput);
+        setSavedInput("");
+      }
+    }
+  }, [
+    clickLayout.inputCursorRow,
+    clickLayout.inputEnd,
+    clickLayout.inputStart,
+    history,
+    historyIdx,
+    input,
+    inputFocused,
+    isExiting,
+    isProcessing,
+    providerPicker,
+    replaceInput,
+    savedInput,
+    slashQuickOptionsVisible,
+    writeTerminal,
+  ]);
+
+  const handleMouseScrollRef = useRef(handleMouseScroll);
+
+  useEffect(() => {
+    handleMouseScrollRef.current = handleMouseScroll;
+  }, [handleMouseScroll]);
+
   useEffect(() => {
     if (!mouseCaptureEnabled || !isRawModeSupported || !stdin.isTTY) return;
 
@@ -590,7 +675,7 @@ export function App({
       const chunk = originalRead(...args as Parameters<typeof originalRead>);
       if (chunk === null) return null;
       const data = typeof chunk === "string" ? chunk : chunk.toString("utf8");
-      const { clean, clicks, cursorReports, remainder } = extractTerminalEvents(
+      const { clean, clicks, scrolls, cursorReports, remainder } = extractTerminalEvents(
         data,
         mouseRemainderRef.current
       );
@@ -601,6 +686,18 @@ export function App({
       for (const click of clicks) {
         handleMouseClickRef.current(click);
       }
+      for (const scroll of scrolls) {
+        handleMouseScrollRef.current(scroll);
+      }
+      // Intercept Ctrl+V (\x16) when a clipboard image is pending
+      if (pendingClipImageRef.current && clean.includes("\x16")) {
+        const filteredClean = clean.replaceAll("\x16", "");
+        handleClipboardPasteRef.current();
+        if (filteredClean.length === 0) return null;
+        if (typeof chunk === "string") return filteredClean;
+        return Buffer.from(filteredClean, "utf8");
+      }
+
       if (clean.length === 0) return null;
       if (typeof chunk === "string") return clean;
       return Buffer.from(clean, "utf8");
@@ -613,6 +710,34 @@ export function App({
       mouseRemainderRef.current = "";
     };
   }, [isRawModeSupported, mouseCaptureEnabled, stdin, writeTerminal]);
+
+  // ── Clipboard image polling ────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (!process.stdout.isTTY) return;
+    ensureScreenshotDir();
+    let lastClipSize = 0;
+    let busy = false;
+
+    const timer = setInterval(() => {
+      if (busy) return;
+      busy = true;
+      void clipboardImageSizeAsync().then((size) => {
+        busy = false;
+        if (size > 0 && size !== lastClipSize) {
+          lastClipSize = size;
+          pendingClipImageRef.current = true;
+          setImageHint(true);
+        } else if (size === 0 && pendingClipImageRef.current) {
+          lastClipSize = 0;
+          pendingClipImageRef.current = false;
+          setImageHint(false);
+        }
+      }).catch(() => { busy = false; });
+    }, 600);
+
+    return () => clearInterval(timer);
+  }, []);
 
   // ── Submit handler ─────────────────────────────────────────────────────────
 
@@ -707,6 +832,14 @@ export function App({
       focusInput();
     } else {
       // ── Chat message ──────────────────────────────────────────────────
+      // Resolve image placeholders → actual file paths before sending
+      let message = trimmed;
+      for (const [placeholder, filePath] of imageMapRef.current) {
+        if (message.includes(placeholder)) {
+          message = message.replaceAll(placeholder, filePath);
+          imageMapRef.current.delete(placeholder);
+        }
+      }
       addLine(`  › ${trimmed}`, "user");
       const transcriptBatch: Array<{
         type: "user" | "assistant" | "tool" | "thinking" | "error";
@@ -774,7 +907,7 @@ export function App({
         },
       };
 
-      await chatSession.send(trimmed, hooks);
+      await chatSession.send(message, hooks);
 
       if (!assistantLineId && responseBuffer.trim()) {
         addLines(responseBuffer.trimEnd().split("\n"), "assistant");
@@ -972,6 +1105,7 @@ export function App({
           inputDisabled={Boolean(providerPicker)}
           isProcessing={isProcessing}
           canSubmit={!isProcessing && providerPicker === null && !slashQuickOptionsVisible}
+          imageHint={imageHint && !isProcessing}
           onChange={setInput}
           onSubmit={handleSubmit}
           onFocusChange={(focused) => {
