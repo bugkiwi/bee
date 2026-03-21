@@ -17,6 +17,7 @@ export function ThinkingStatusLine({ label }: { label: string }) {
 
   return (
     <Box width="100%">
+      {/* empty label-column spacer for alignment with › label column */}
       <Box width={CONTENT_LABEL_WIDTH} marginRight={CONTENT_LABEL_GAP} flexShrink={0}>
         <Text color="gray" dimColor>
           THINKING

@@ -320,7 +320,10 @@ export class AgentLoop {
       return handoffContext;
     } catch (err) {
       await this.askPlanStore.updateNodeStatus(planId, node.id, "failed");
-      throw err;
+      // Wrap as NodeFailedError so ask.ts can handle it gracefully (same as runSkeleton)
+      const e = err instanceof Error ? err : new Error(String(err));
+      if (err instanceof NodeFailedError) throw err;
+      throw new NodeFailedError(node.id, node.title, e);
     }
   }
 

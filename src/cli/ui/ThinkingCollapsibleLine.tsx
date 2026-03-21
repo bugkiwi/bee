@@ -76,6 +76,7 @@ export function ThinkingCollapsibleLine({
   return (
     <Box flexDirection="column" width={panelWidth}>
       <Box width="100%">
+        {/* empty label-column spacer for alignment with › label column */}
         <Box width={CONTENT_LABEL_WIDTH} marginRight={CONTENT_LABEL_GAP} flexShrink={0} />
         <Box flexGrow={1}>
           <Text color={isFocused ? "white" : "gray"} wrap="truncate-end">
@@ -91,6 +92,7 @@ export function ThinkingCollapsibleLine({
         <Box flexDirection="column" marginTop={1}>
           {truncated ? (
             <Box width="100%">
+              {/* empty label-column spacer for alignment with › label column */}
               <Box width={CONTENT_LABEL_WIDTH} marginRight={CONTENT_LABEL_GAP} flexShrink={0} />
               <Box flexGrow={1}>
                 <Text color="gray" dimColor>
@@ -103,6 +105,7 @@ export function ThinkingCollapsibleLine({
             .filter((line) => line.id !== summarySource?.id)
             .map((line) => (
               <Box key={line.id} width="100%">
+                {/* empty label-column spacer for alignment with › label column */}
                 <Box width={CONTENT_LABEL_WIDTH} marginRight={CONTENT_LABEL_GAP} flexShrink={0} />
                 <Box flexGrow={1} flexDirection="column">
                   {line.meta?.kind === "tool-diff" ? (

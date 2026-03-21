@@ -56,8 +56,21 @@ describe("ui content helpers", () => {
     expect(getContentBodyWidth(40, false)).toBe(40);
   });
 
+  it("labels user lines as ›", () => {
+    expect(getContentLineLabel({ type: "user" })).toBe("›");
+  });
+
   it("keeps assistant aligned without rendering an ANSWER label", () => {
     expect(getContentLineLabel({ type: "assistant" })).toBeNull();
     expect(hasContentLineLeadingColumn({ type: "assistant" })).toBe(true);
+  });
+
+  it("regression: ASK and ANSWER strings are absent from rendered labels", () => {
+    const userLabel = getContentLineLabel({ type: "user" });
+    const assistantLabel = getContentLineLabel({ type: "assistant" });
+    expect(userLabel).not.toBe("ASK");
+    expect(userLabel).not.toContain("ASK");
+    expect(assistantLabel).not.toBe("ANSWER");
+    expect(String(assistantLabel)).not.toContain("ANSWER");
   });
 });

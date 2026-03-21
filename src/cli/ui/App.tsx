@@ -41,7 +41,6 @@ import { InputPanel } from "./InputPanel.tsx";
 import { extractTerminalEvents } from "./terminal.ts";
 import { ThinkingCollapsibleLine } from "./ThinkingCollapsibleLine.tsx";
 import { StatusBar, type StatusPhase } from "./StatusBar.tsx";
-import { detectPlanningIntent } from "../../utils/intent.ts";
 import { summarizeToolDiff } from "../../utils/diff-preview.ts";
 import type {
   ContentLine,
@@ -195,8 +194,8 @@ export function App({
 
   // ── Helpers ────────────────────────────────────────────────────────────────
 
-  const addLine = useCallback((text: string, type: ContentLine["type"], meta?: ContentLine["meta"]) => {
-    setLines((prev) => [...prev, { id: nextLineId(type), text, type, ...(meta ? { meta } : {}) }]);
+  const addLine = useCallback((text: string, type: ContentLine["type"], meta?: ContentLine["meta"], isFirstAssistantInTurn?: boolean) => {
+    setLines((prev) => [...prev, { id: nextLineId(type), text, type, ...(meta ? { meta } : {}), ...(isFirstAssistantInTurn ? { isFirstAssistantInTurn: true } : {}) }]);
   }, [nextLineId]);
 
   const addLines = useCallback((texts: string[], type: ContentLine["type"], meta?: ContentLine["meta"]) => {
@@ -877,21 +876,6 @@ export function App({
       setHasAssistantStream(false);
       setIsProcessing(false);
       focusInput();
-    } else if (detectPlanningIntent(trimmed)) {
-      // ── Planning intent detected ──────────────────────────────────────
-      // Route to the ask flow: decompose → plan → execute
-      addLine(`  › ${trimmed}`, "user");
-      setIsProcessing(true);
-      setActiveThinkingLabel(null);
-      const output = await captureStream(async () => {
-        await onCommand("ask", trimmed.split(/\s+/));
-      });
-      if (output.trim()) {
-        addLines(stripAnsi(output.trimEnd()).split("\n"), "system");
-      }
-      setActiveProvider(config.provider);
-      setIsProcessing(false);
-      focusInput();
     } else {
       // ── Chat message ──────────────────────────────────────────────────
       // Resolve image placeholders → actual file paths before sending
@@ -939,7 +923,9 @@ export function App({
           lastThinking = note;
           setActiveThinkingLabel(null);
           const line = `  💭 ${note}`;
-          addLine(line, "thinking");
+          const firstInTurn = isFirstAssistantLine;
+          if (firstInTurn) isFirstAssistantLine = false;
+          addLine(line, "thinking", undefined, firstInTurn);
           transcriptBatch.push({ type: "thinking", text: line });
         },
         onTool: (name, preview) => {
@@ -992,14 +978,32 @@ export function App({
           addLine(line, "error");
           transcriptBatch.push({ type: "error", text: line });
         },
+        onPlanIntent: (goal) => { planGoal = goal; },
       };
 
+      let planGoal: string | null = null;
       await chatSession.send(message, hooks);
 
-      finalizeAssistantSegment();
-      await chatSession.appendTranscript(transcriptBatch);
-      setActiveThinkingLabel(null);
-      setHasAssistantStream(false);
+      if (planGoal) {
+        // LLM detected a planning task — route to ask flow
+        try {
+          const output = await captureStream(async () => {
+            await onCommand("ask", [planGoal!]);
+          });
+          if (output.trim()) {
+            addLines(stripAnsi(output.trimEnd()).split("\n"), "system");
+          }
+        } catch (err) {
+          addLine(`  Plan failed: ${String(err)}`, "error");
+        }
+        setActiveProvider(config.provider);
+        setHasAssistantStream(false);
+      } else {
+        finalizeAssistantSegment();
+        await chatSession.appendTranscript(transcriptBatch);
+        setActiveThinkingLabel(null);
+        setHasAssistantStream(false);
+      }
       setIsProcessing(false);
       focusInput();
     }
@@ -1136,8 +1140,8 @@ export function App({
   // ── Render ─────────────────────────────────────────────────────────────────
 
   const renderContentLine = (line: ContentLine) => {
-    const label = line.type === "assistant" && line.isFirstAssistantInTurn
-      ? "ANSWER"
+    const label = line.isFirstAssistantInTurn
+      ? "›"
       : getContentLineLabel(line);
     const bodyText = line.type === "assistant" ? renderMarkdown(line.text) : getContentLineText(line);
     const bodyLines = bodyText.split("\n");
@@ -1155,6 +1159,12 @@ export function App({
       );
     }
 
+    // Label color/weight per role:
+    //   user      → yellow + bold
+    //   assistant → no color (undefined) + bold
+    //   error     → red + bold
+    //   thinking  → gray + dim
+    //   tool      → gray + dim
     const labelColor =
       line.type === "user"
         ? "yellow"

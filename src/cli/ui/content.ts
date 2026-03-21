@@ -2,8 +2,23 @@ import stringWidth from "string-width";
 import type { ContentLine } from "./types.ts";
 import { MAX_HISTORY_ENTRIES, THINKING_SUMMARY_MAX } from "./types.ts";
 
-export const CONTENT_LABEL_WIDTH = 9;
-export const CONTENT_LABEL_GAP = 2;
+/**
+ * Fixed character-width of the left label column.
+ * Sized for the single '›' character used as the user/assistant turn label,
+ * ensuring body content is always aligned to the same column.
+ *
+ * Consumers: App.tsx, ThinkingCollapsibleLine.tsx, ThinkingStatusLine.tsx
+ */
+export const CONTENT_LABEL_WIDTH = 1;
+
+/**
+ * Gap (in characters) between the label column and the body column.
+ * Added after CONTENT_LABEL_WIDTH to give visual breathing room before
+ * the message body begins.
+ *
+ * Consumers: App.tsx, ThinkingCollapsibleLine.tsx, ThinkingStatusLine.tsx
+ */
+export const CONTENT_LABEL_GAP = 1;
 export type MetaGroupType = "thinking" | "tool";
 
 export function toInlineSummaryText(text: string): string {
@@ -35,10 +50,19 @@ export function isCollapsibleThinkingLine(text: string): boolean {
   return /\S/.test(text);
 }
 
+/**
+ * Returns the display label for a content line, or null if none applies.
+ *
+ * NOTE: The 'ANSWER' label is NOT produced here.
+ * assistant-type lines intentionally fall through to `default` and return null.
+ * 'ANSWER' is injected by renderContentLine() in App.tsx, which checks
+ * line.isFirstAssistantInTurn and overrides the null with 'ANSWER' for the
+ * first assistant line in each turn.
+ */
 export function getContentLineLabel(line: Pick<ContentLine, "type">): string | null {
   switch (line.type) {
     case "user":
-      return "ASK";
+      return "›"; // label='›', role=user, color=yellow (bold)
     case "thinking":
       return "THINKING";
     case "tool":

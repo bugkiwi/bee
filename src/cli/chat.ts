@@ -210,7 +210,13 @@ export interface ChatRenderHooks {
   onToolSummary?: (summary: string) => void;
   onText?: (text: string) => void;
   onError?: (text: string) => void;
+  /** Fired instead of onText when the response is a plan routing marker */
+  onPlanIntent?: (goal: string) => void;
 }
+
+const PLAN_INTENT_PREFIX = `[If the following message is a software development task (build, fix, implement, create, add, migrate, refactor, debug, or similar — in ANY human language), respond ONLY with: <bee:plan goal="<concise English goal>"/>. Otherwise respond normally.]
+
+`;
 
 export interface ChatOptions {
   /** Called with a message when the session starts working, null when done. */
@@ -466,9 +472,9 @@ export class ChatSession {
       args.push("--resume", this._claudeSessionId!);
     }
 
-    // Prompt goes via stdin (edit mode)
+    // Prompt goes via stdin (edit mode); prepend classifier so LLM can route to plan flow
     const proc = Bun.spawn(args, {
-      stdin: new Blob([userMessage]),
+      stdin: new Blob([PLAN_INTENT_PREFIX + userMessage]),
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -489,6 +495,11 @@ export class ChatSession {
     function stopOnce() {
       if (!spinnerStopped) { stopSpinner(); spinnerStopped = true; }
     }
+
+    // Plan-intent detection: if LLM responds with <bee:plan goal="..."/>, suppress
+    // onText and fire onPlanIntent instead — detected on first text chunk.
+    let planMarkerDetected = false;
+    let firstTextSeen = false;
 
     try {
       while (true) {
@@ -525,13 +536,20 @@ export class ChatSession {
           if (ev.type === "assistant" && Array.isArray(ev.message?.content)) {
             for (const block of ev.message!.content!) {
               if (block.type === "text" && block.text) {
+                fullText += block.text;
+                if (!firstTextSeen) {
+                  firstTextSeen = true;
+                  if (fullText.trimStart().startsWith("<bee:plan")) {
+                    planMarkerDetected = true;
+                  }
+                }
+                if (planMarkerDetected) continue;
                 tracker.beforeText();
                 if (eventMode) {
                   hooks?.onText?.(block.text);
                 } else {
                   process.stdout.write(block.text);
                 }
-                fullText += block.text;
               } else if (block.type === "tool_use") {
                 tracker.track(block.name ?? "", block.input ?? {});
               } else if (block.type === "thinking") {
@@ -575,6 +593,11 @@ export class ChatSession {
     if (authErr) throw new Error(authErr);
     if (proc.exitCode !== 0 && stderrText.trim() && !fullText.trim()) {
       throw new Error(stderrText.trim());
+    }
+
+    if (planMarkerDetected && eventMode) {
+      const match = fullText.trim().match(/^<bee:plan\s+goal="([^"]+)"\s*\/?>/);
+      if (match) hooks?.onPlanIntent?.(match[1]!);
     }
 
     return fullText.trim();
