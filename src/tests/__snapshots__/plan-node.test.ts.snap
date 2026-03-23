@@ -1,0 +1,40 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`PlanNode snapshots statusBadge output matches snapshot for all statuses 1`] = `
+{
+  "completed": "✅",
+  "failed": "✗",
+  "paused": "⏸",
+  "pending": "○",
+  "running": "▶",
+}
+`;
+
+exports[`PlanNode snapshots statusColor output matches snapshot for all statuses 1`] = `
+{
+  "completed": "green",
+  "failed": "red",
+  "paused": "yellow",
+  "pending": "gray",
+  "running": "cyan",
+}
+`;
+
+exports[`PlanNode snapshots connector lines match snapshot for a 3-task plan 1`] = `
+[
+  "├─",
+  "├─",
+  "└─",
+]
+`;
+
+exports[`PlanNode snapshots plan header data matches snapshot 1`] = `
+{
+  "badge": "▶",
+  "color": "cyan",
+  "id": "snap-plan",
+  "status": "running",
+  "taskCount": 2,
+  "title": "Snapshot Plan",
+}
+`;

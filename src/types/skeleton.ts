@@ -1,5 +1,6 @@
 export type SkeletonNodeStatus = "pending" | "running" | "done" | "failed";
 
+/** A node in the skeleton plan graph, representing a discrete unit of work. */
 export interface SkeletonNode {
   id: string;
   title: string;
@@ -10,6 +11,7 @@ export interface SkeletonNode {
   status: SkeletonNodeStatus;
 }
 
+/** The top-level skeleton plan containing an ordered graph of SkeletonNodes. */
 export interface PlanSkeleton {
   id: string;
   goal: string;

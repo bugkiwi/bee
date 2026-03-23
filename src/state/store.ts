@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import type { StateFile } from "../types/state.ts";
-import type { TaskStatus } from "../types/task.ts";
+import type { AgentTaskStatus as TaskStatus } from "../types/task.ts";
 import { StateFileSchema } from "../schema/state.schema.ts";
 import { readJsonFile, writeJsonFile } from "../utils/fs.ts";
 

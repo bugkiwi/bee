@@ -1,4 +1,4 @@
-import type { TaskStatus } from "../types/task.ts";
+import type { AgentTaskStatus as TaskStatus } from "../types/task.ts";
 import {
   TRANSITIONS,
   TERMINAL_STATES,

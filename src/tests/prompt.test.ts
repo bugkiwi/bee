@@ -1,6 +1,6 @@
 import { expect, test, describe } from "bun:test";
 import { buildPrompt } from "../utils/prompt.ts";
-import type { Task } from "../types/task.ts";
+import type { AgentTask as Task } from "../types/task.ts";
 
 const baseTask: Task = {
   task_id: "task_abc",

@@ -17,6 +17,7 @@ export type TraceEventKind =
   | "plugin.diff_engine"
   | "plugin.critic";
 
+/** A structured observability event emitted during task or provider lifecycle transitions. */
 export interface TraceEvent {
   trace_id: string;
   run_id: string;
@@ -27,6 +28,7 @@ export interface TraceEvent {
   data?: Record<string, unknown>;
 }
 
+/** A billing record capturing token usage and USD cost for a single provider run. */
 export interface CostRecord {
   trace_id: string;
   task_id: string;

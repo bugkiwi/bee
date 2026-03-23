@@ -1,6 +1,6 @@
 import chalk from "chalk";
 import Table from "cli-table3";
-import type { Task } from "../types/task.ts";
+import type { AgentTask as Task } from "../types/task.ts";
 import type { StateFile } from "../types/state.ts";
 
 const STATUS_COLORS: Record<string, (s: string) => string> = {

@@ -1,0 +1,101 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`SubChatPanel snapshot — empty log matches snapshot for default props with no log lines 1`] = `
+{
+  "logLines": [],
+  "scrollOffset": 0,
+  "status": "pending",
+  "statusColor": "gray",
+  "statusLabel": "pending",
+  "title": "My Sub-Task",
+  "visibleLines": [],
+  "visibleWindow": [
+    0,
+    0,
+  ],
+}
+`;
+
+exports[`SubChatPanel log-line ordering matches snapshot for a populated log 1`] = `
+{
+  "logLines": [
+    "first line",
+    "second line",
+    "third line",
+  ],
+  "visibleLines": [
+    "first line",
+    "second line",
+    "third line",
+  ],
+  "visibleWindow": [
+    0,
+    3,
+  ],
+}
+`;
+
+exports[`SubChatPanel status variants — StatusBadge label each status renders without errors (data snapshot) 1`] = `
+[
+  {
+    "color": "gray",
+    "label": "pending",
+    "status": "pending",
+  },
+  {
+    "color": "blue",
+    "label": "running",
+    "status": "running",
+  },
+  {
+    "color": "green",
+    "label": "done",
+    "status": "completed",
+  },
+  {
+    "color": "red",
+    "label": "failed",
+    "status": "failed",
+  },
+  {
+    "color": "gray",
+    "label": "skipped",
+    "status": "skipped",
+  },
+]
+`;
+
+exports[`SubChatPanel prop snapshots matches snapshot for running status with populated log 1`] = `
+{
+  "color": "blue",
+  "label": "running",
+  "status": "running",
+  "title": "Task A",
+  "visibleLines": [
+    "Fetching data…",
+    "Processing…",
+    "Done.",
+  ],
+  "visibleWindow": [
+    0,
+    3,
+  ],
+}
+`;
+
+exports[`SubChatPanel prop snapshots matches snapshot for failed status 1`] = `
+{
+  "color": "red",
+  "label": "failed",
+  "status": "failed",
+  "title": "Task B",
+  "visibleLines": [
+    "Starting…",
+    "Error: connection refused",
+  ],
+  "visibleWindow": [
+    0,
+    2,
+  ],
+}
+`;

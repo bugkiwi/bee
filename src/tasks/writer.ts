@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import type { Task } from "../types/task.ts";
+import type { AgentTask as Task } from "../types/task.ts";
 import { writeJsonFile } from "../utils/fs.ts";
 
 export class TaskWriter {

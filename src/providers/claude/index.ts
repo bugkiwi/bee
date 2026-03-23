@@ -1,6 +1,6 @@
 import { BaseProvider } from "../base.ts";
 import type { ProviderEvent, ProviderResult, StreamCallback } from "../../types/provider.ts";
-import type { Task } from "../../types/task.ts";
+import type { AgentTask as Task } from "../../types/task.ts";
 import { buildPrompt } from "../../utils/prompt.ts";
 import { withTimeout } from "../../utils/timeout.ts";
 import { parseClaudeStream } from "./parser.ts";

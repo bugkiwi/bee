@@ -1,4 +1,4 @@
-import type { Task } from "../types/task.ts";
+import type { AgentTask as Task } from "../types/task.ts";
 import { TaskSchema } from "../schema/task.schema.ts";
 import { readJsonFile, listFiles } from "../utils/fs.ts";
 

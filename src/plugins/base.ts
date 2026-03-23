@@ -1,4 +1,4 @@
-import type { Task } from "../types/task.ts";
+import type { AgentTask as Task } from "../types/task.ts";
 import type { WorkspaceConfig } from "../types/config.ts";
 
 export interface PluginContext {

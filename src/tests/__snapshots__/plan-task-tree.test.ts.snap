@@ -1,0 +1,51 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`PlanTaskTree snapshots plan list structure matches snapshot 1`] = `
+[
+  {
+    "id": "p1",
+    "status": "running",
+    "taskCount": 1,
+    "title": "Plan Alpha",
+  },
+  {
+    "id": "p2",
+    "status": "completed",
+    "taskCount": 0,
+    "title": "Plan Beta",
+  },
+  {
+    "id": "p3",
+    "status": "failed",
+    "taskCount": 2,
+    "title": "Plan Gamma",
+  },
+]
+`;
+
+exports[`PlanTaskTree snapshots empty plans list produces empty-state snapshot 1`] = `
+{
+  "count": 0,
+  "isEmpty": true,
+}
+`;
+
+exports[`PlanTaskTree snapshots plan keys (ids) match snapshot 1`] = `
+[
+  "snap-p1",
+  "snap-p2",
+]
+`;
+
+exports[`PlanTaskTree snapshots renders nested plan/task hierarchy with inline detail lines 1`] = `
+"◇ 帮我做一个卖书的网站                                             [ ▶ RUNNING ]
+────────────────────────────────────────────────────────────────────────────
+├─ • [ PLAN ] 项目初始化 & 工程配置                                   [ ✓ DONE ]
+└─ ▾ [ PLAN ] 数据库 Schema & Migration                             [ ◆ VERIFY ]
+   ├─ • [ TASK ] 编写 books / categories / tags 表 migration + index  [ ✓ DONE ]
+   │     ✓ bun run db:migrate 成功
+   │     ✓ books 表全文索引（tsvector）
+   └─ • [ TASK ] 编写 payments 表 + 支付状态枚举类型               [ • PENDING ]
+         ✓ payments.status 为 PG ENUM
+         ✓ 含 idempotency_key unique 约束"
+`;

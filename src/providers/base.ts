@@ -1,5 +1,5 @@
 import type { IProvider, ProviderResult, StreamCallback } from "../types/provider.ts";
-import type { Task } from "../types/task.ts";
+import type { AgentTask as Task } from "../types/task.ts";
 
 export abstract class BaseProvider implements IProvider {
   abstract readonly name: string;

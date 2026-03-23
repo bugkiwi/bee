@@ -1,0 +1,34 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`TaskNode snapshots statusBadge output matches snapshot for all TaskStatus values 1`] = `
+{
+  "completed": "✅",
+  "failed": "✗",
+  "pending": "○",
+  "running": "▶",
+  "skipped": "⊘",
+}
+`;
+
+exports[`TaskNode snapshots statusColor output matches snapshot for all TaskStatus values 1`] = `
+{
+  "completed": "green",
+  "failed": "red",
+  "pending": "gray",
+  "running": "cyan",
+  "skipped": "yellow",
+}
+`;
+
+exports[`TaskNode snapshots stepProgress output matches snapshot for a representative task 1`] = `"2/4 steps"`;
+
+exports[`TaskNode snapshots task node data matches snapshot 1`] = `
+{
+  "badge": "▶",
+  "color": "cyan",
+  "goal": "Deploy to production",
+  "id": "snap-task",
+  "progress": "1/2 steps",
+  "status": "running",
+}
+`;

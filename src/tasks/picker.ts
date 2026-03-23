@@ -1,4 +1,4 @@
-import type { Task } from "../types/task.ts";
+import type { AgentTask as Task } from "../types/task.ts";
 
 export class TaskPicker {
   pickNext(tasks: Task[]): Task | null {

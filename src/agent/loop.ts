@@ -1,4 +1,4 @@
-import type { Task } from "../types/task.ts";
+import type { AgentTask as Task } from "../types/task.ts";
 import type { Plan } from "../types/plan.ts";
 import type { PlanSkeleton, SkeletonNode, SkeletonProgressEvent } from "../types/skeleton.ts";
 import type { AskPlan, AskPlanNode } from "../types/ask-plan.ts";

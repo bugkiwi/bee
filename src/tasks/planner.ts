@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Task } from "../types/task.ts";
+import type { AgentTask as Task } from "../types/task.ts";
 import type { PlanSkeleton } from "../types/skeleton.ts";
 import type { AskPlan, AskPlanNode } from "../types/ask-plan.ts";
 import { TaskSchema } from "../schema/task.schema.ts";
@@ -99,7 +99,7 @@ Schema: { "decompose": boolean, "reason": "string (one sentence)" }
 Decompose if the phase:
 - Involves 3+ distinct technical concerns (e.g. schema + API + UI)
 - Spans multiple layers of the stack
-- Would clearly produce 3-5 natural sub-phases of roughly equal scope
+- Would clearly produce 2-5 natural sub-phases of roughly equal scope
 
 Do NOT decompose if:
 - The phase is already narrowly scoped

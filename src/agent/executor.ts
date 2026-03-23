@@ -1,4 +1,4 @@
-import type { Task } from "../types/task.ts";
+import type { AgentTask as Task } from "../types/task.ts";
 import type { ProviderEvent, ProviderResult, StreamCallback } from "../types/provider.ts";
 import type { RunRecord } from "../types/state.ts";
 import { ProviderRegistry } from "../providers/registry.ts";

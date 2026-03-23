@@ -1,0 +1,83 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`StatusBadge snapshots COLOR_MAP matches snapshot 1`] = `
+{
+  "completed": "green",
+  "failed": "red",
+  "paused": "gray",
+  "pending": "gray",
+  "running": "blue",
+  "skipped": "gray",
+}
+`;
+
+exports[`StatusBadge snapshots LABEL_MAP matches snapshot 1`] = `
+{
+  "completed": "done",
+  "failed": "failed",
+  "paused": "paused",
+  "pending": "pending",
+  "running": "running",
+  "skipped": "skipped",
+}
+`;
+
+exports[`StatusBadge snapshots color/label pairs match snapshot for all PlanStatus values 1`] = `
+[
+  {
+    "color": "gray",
+    "label": "pending",
+    "status": "pending",
+  },
+  {
+    "color": "blue",
+    "label": "running",
+    "status": "running",
+  },
+  {
+    "color": "gray",
+    "label": "paused",
+    "status": "paused",
+  },
+  {
+    "color": "green",
+    "label": "done",
+    "status": "completed",
+  },
+  {
+    "color": "red",
+    "label": "failed",
+    "status": "failed",
+  },
+]
+`;
+
+exports[`StatusBadge snapshots color/label pairs match snapshot for all TaskStatus values 1`] = `
+[
+  {
+    "color": "gray",
+    "label": "pending",
+    "status": "pending",
+  },
+  {
+    "color": "blue",
+    "label": "running",
+    "status": "running",
+  },
+  {
+    "color": "green",
+    "label": "done",
+    "status": "completed",
+  },
+  {
+    "color": "red",
+    "label": "failed",
+    "status": "failed",
+  },
+  {
+    "color": "gray",
+    "label": "skipped",
+    "status": "skipped",
+  },
+]
+`;

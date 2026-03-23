@@ -1,4 +1,4 @@
-import type { Task } from "../types/task.ts";
+import type { AgentTask as Task } from "../types/task.ts";
 import type { ContextFile } from "../plugins/context-selector.ts";
 import { formatContextForPrompt } from "../plugins/context-selector.ts";
 

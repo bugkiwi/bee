@@ -1,6 +1,6 @@
 import { expect, test, describe } from "bun:test";
 import { StateMachine } from "../state/machine.ts";
-import type { TaskStatus } from "../types/task.ts";
+import type { AgentTaskStatus as TaskStatus } from "../types/task.ts";
 
 describe("StateMachine", () => {
   const sm = new StateMachine();

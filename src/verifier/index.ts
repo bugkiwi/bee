@@ -1,4 +1,4 @@
-import type { Task } from "../types/task.ts";
+import type { AgentTask as Task } from "../types/task.ts";
 import type { VerificationResult, VerificationSummary } from "../types/verifier.ts";
 import { runTestCheck } from "./checks/tests.ts";
 import { runLintCheck } from "./checks/lint.ts";
