@@ -1,4 +1,5 @@
 import type { Task } from "../types/task.ts";
+import type { Plan } from "../types/plan.ts";
 import type { PlanSkeleton, SkeletonNode, SkeletonProgressEvent } from "../types/skeleton.ts";
 import type { AskPlan, AskPlanNode } from "../types/ask-plan.ts";
 import type { WorkspaceConfig } from "../types/config.ts";
@@ -96,7 +97,8 @@ export class AgentLoop {
 
   constructor(
     private readonly config: WorkspaceConfig,
-    dirs: { tasks: string; state: string; logs: string; plans?: string }
+    dirs: { tasks: string; state: string; logs: string; plans?: string },
+    stores?: { askPlanStore?: AskPlanStore }
   ) {
     const plansDir = dirs.plans ?? join(dirname(dirs.state), "plans");
     this.dirs = { ...dirs, plans: plansDir };
@@ -107,7 +109,7 @@ export class AgentLoop {
     this.stateStore = new StateStore(dirs.state);
     this.sessionStore = new SessionStore(dirs.state);
     this.skeletonStore = new SkeletonStore(dirs.state);
-    this.askPlanStore = new AskPlanStore(plansDir);
+    this.askPlanStore = stores?.askPlanStore ?? new AskPlanStore(plansDir);
     this.executor = new TaskExecutor(config);
     this.retrier = new Retrier({
       max_attempts: config.max_retries,
@@ -462,8 +464,21 @@ export class AgentLoop {
 
     let attempt = state.runs.length;
     let keepRunning = true;
+    let isInPlanMode = false;
     // Track current provider (may switch mid-run on limit)
     let activeProvider = session.active_provider ?? this.config.provider;
+
+    const onToolCall = (name: string, input: Record<string, unknown>): void => {
+      if (name === "EnterPlanMode") {
+        try {
+          const plan = input as unknown as Plan;
+          this.askPlanStore.setActivePlan(plan);
+          isInPlanMode = true;
+        } catch {
+          // Ignore invalid plan payloads — loop must not enter error state
+        }
+      }
+    };
 
     while (keepRunning) {
       // Execute
@@ -472,7 +487,8 @@ export class AgentLoop {
         tracer,
         logger,
         costTracker,
-        attempt
+        attempt,
+        onToolCall
       );
 
       // Track tokens in session

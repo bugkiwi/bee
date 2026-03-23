@@ -40,9 +40,11 @@ describe("SessionManager", () => {
     expect(session.projectPath).toBe("/Users/test/Work/project");
     expect(session.activeProvider).toBe("claude");
     expect(session.messageCount).toBe(0);
+    expect(session.transcriptSeq).toBe(0);
     expect(session.transcript).toEqual([]);
     expect(session.providers.claude).toBeTruthy();
     expect(session.providers.claude!.nativeId).toBeNull();
+    expect(session.providers.claude!.syncedThrough).toBe(0);
     expect(session.providers.claude!.tokens).toBe(0);
   });
 
@@ -132,6 +134,7 @@ describe("SessionManager", () => {
     const loaded = await mgr.load(session.id);
     expect(loaded!.activeProvider).toBe("codex");
     expect(loaded!.providers.codex).toBeTruthy();
+    expect(loaded!.providers.codex!.syncedThrough).toBe(0);
   });
 
   it("increments message count", async () => {
@@ -151,14 +154,31 @@ describe("SessionManager", () => {
     const session = await mgr.create("claude");
 
     await mgr.appendTranscript(session, [
-      { type: "user", text: "  › hello", at: "2026-01-01T00:00:00.000Z" },
-      { type: "assistant", text: "Hi", at: "2026-01-01T00:00:01.000Z" },
+      { type: "user", text: "  › hello", at: "2026-01-01T00:00:00.000Z", seq: 0 },
+      { type: "assistant", text: "Hi", at: "2026-01-01T00:00:01.000Z", seq: 0 },
     ]);
 
     const loaded = await mgr.load(session.id);
     expect(loaded!.transcript.length).toBe(2);
+    expect(loaded!.transcriptSeq).toBe(2);
     expect(loaded!.transcript[0]!.type).toBe("user");
+    expect(loaded!.transcript[0]!.seq).toBe(1);
     expect(loaded!.transcript[1]!.type).toBe("assistant");
+    expect(loaded!.transcript[1]!.seq).toBe(2);
+  });
+
+  it("marks providers synced through the current transcript sequence", async () => {
+    const mgr = new SessionManager("/Users/test/Work/project", baseDir);
+    const session = await mgr.create("claude");
+
+    await mgr.appendTranscript(session, [
+      { type: "user", text: "  › hello", at: "2026-01-01T00:00:00.000Z", seq: 0 },
+      { type: "assistant", text: "Hi", at: "2026-01-01T00:00:01.000Z", seq: 0 },
+    ]);
+    await mgr.markProviderSynced(session, "claude");
+
+    const loaded = await mgr.load(session.id);
+    expect(loaded!.providers.claude!.syncedThrough).toBe(2);
   });
 
   it("resets conversation continuity", async () => {
@@ -168,14 +188,16 @@ describe("SessionManager", () => {
     await mgr.bindNativeId(session, "claude", "native-uuid-123");
     await mgr.recordMessage(session);
     await mgr.appendTranscript(session, [
-      { type: "user", text: "  › test", at: "2026-01-01T00:00:00.000Z" },
+      { type: "user", text: "  › test", at: "2026-01-01T00:00:00.000Z", seq: 0 },
     ]);
     await mgr.resetConversation(session);
 
     const loaded = await mgr.load(session.id);
     expect(loaded!.messageCount).toBe(0);
+    expect(loaded!.transcriptSeq).toBe(0);
     expect(loaded!.transcript).toEqual([]);
     expect(loaded!.providers.claude!.nativeId).toBeNull();
+    expect(loaded!.providers.claude!.syncedThrough).toBe(0);
   });
 
   it("loads legacy session files without transcript", async () => {
@@ -207,6 +229,7 @@ describe("SessionManager", () => {
 
     const loaded = await mgr.load(sessionId);
     expect(loaded).not.toBeNull();
+    expect(loaded!.transcriptSeq).toBe(0);
     expect(loaded!.transcript).toEqual([]);
   });
 
@@ -365,5 +388,24 @@ describe("ChatSession switchProvider", () => {
     expect(reloaded).not.toBeNull();
     expect(reloaded!.activeProvider).toBe("kimi");
     expect(reloaded!.providers.kimi).toBeTruthy();
+  });
+
+  it("marks the active provider synced after transcript append", async () => {
+    const projectPath = "/Users/test/Work/project-chat-sync-provider";
+    const mgr = new SessionManager(projectPath, baseDir);
+    const config = { ...DEFAULT_CONFIG, provider: "claude" };
+    const chat = new ChatSession(config, { projectPath });
+    (chat as unknown as { _sessionManager: SessionManager })._sessionManager = mgr;
+
+    const session = await chat.initSession();
+    await chat.appendTranscript([
+      { type: "user", text: "  › fix the parser" },
+      { type: "assistant", text: "Parser updated." },
+    ]);
+
+    const reloaded = await mgr.load(session.id);
+    expect(reloaded).not.toBeNull();
+    expect(reloaded!.transcriptSeq).toBe(2);
+    expect(reloaded!.providers.claude!.syncedThrough).toBe(2);
   });
 });

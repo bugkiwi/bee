@@ -4,6 +4,7 @@ import type { BeeSession, BeeTranscriptLine } from "../session/manager.ts";
 import { SessionManager } from "../session/manager.ts";
 import type { ToolDiffMeta } from "../types/transcript.ts";
 import { createToolDiffPreview } from "../utils/diff-preview.ts";
+import { stripAnsi } from "../utils/strip-ansi.ts";
 
 // ─── Content block types ──────────────────────────────────────────────────────
 
@@ -191,8 +192,9 @@ function startSpinner(label: string): () => void {
 //   - Codex:  --session-id passed in args (Codex maintains conversation)
 //   - Kimi:   --session <id>       (Kimi CLI maintains conversation)
 //
-// No message history is stored in-process — the provider owns the context.
-// This eliminates the O(n) token growth of the old buildPrompt() approach.
+// Providers own their native threads, but Bee also keeps a lightweight global
+// transcript. When switching providers, Bee injects only the unseen transcript
+// delta so the target provider can catch up instead of starting cold.
 
 export interface SessionStats {
   durationMs: number;
@@ -230,6 +232,88 @@ export interface InitSessionOptions {
   resumeSessionId?: string;
   /** Resume the newest session in current project when no explicit id is given. */
   resumeLatest?: boolean;
+}
+
+const HANDOFF_MAX_LINES = 120;
+const HANDOFF_MAX_CHARS = 16_000;
+
+function transcriptRoleLabel(type: BeeTranscriptLine["type"]): string {
+  switch (type) {
+    case "user":
+      return "User";
+    case "assistant":
+      return "Assistant";
+    case "tool":
+      return "Tool";
+    case "thinking":
+      return "Thinking";
+    case "error":
+      return "Error";
+  }
+}
+
+function renderHandoffLines(lines: BeeTranscriptLine[]): string {
+  return lines
+    .map((line) => {
+      const text = stripAnsi(line.text).trimEnd();
+      return `[${transcriptRoleLabel(line.type)}]\n${text}`;
+    })
+    .join("\n\n");
+}
+
+export function buildProviderHandoff(session: BeeSession | null, provider: string): string | null {
+  if (!session || session.transcript.length === 0) return null;
+
+  const latestSeq =
+    typeof session.transcriptSeq === "number"
+      ? session.transcriptSeq
+      : (session.transcript.at(-1)?.seq ?? 0);
+  const syncedThrough = session.providers[provider]?.syncedThrough ?? 0;
+  if (latestSeq <= syncedThrough) return null;
+
+  const pendingLines = session.transcript.filter((line) => line.seq > syncedThrough);
+  if (pendingLines.length === 0) return null;
+
+  const retainedFromSeq = session.transcript[0]?.seq ?? latestSeq;
+  const omittedByRetention = retainedFromSeq > syncedThrough + 1;
+
+  let visibleLines = pendingLines.slice(-HANDOFF_MAX_LINES);
+  let omittedByBudget = pendingLines.length - visibleLines.length;
+  let transcriptText = renderHandoffLines(visibleLines);
+  while (transcriptText.length > HANDOFF_MAX_CHARS && visibleLines.length > 1) {
+    visibleLines = visibleLines.slice(1);
+    omittedByBudget++;
+    transcriptText = renderHandoffLines(visibleLines);
+  }
+
+  const notes: string[] = [];
+  if (omittedByRetention) {
+    notes.push(
+      "Some earlier unseen context is not available because Bee only retains the recent transcript window."
+    );
+  }
+  if (omittedByBudget > 0) {
+    notes.push(`Older unseen transcript lines were trimmed for brevity (${omittedByBudget} omitted).`);
+  }
+
+  return [
+    "You are continuing an existing Bee session after a provider switch.",
+    "Review the transcript below as established context before answering the new user message.",
+    ...(notes.length > 0 ? [`Notes: ${notes.join(" ")}`] : []),
+    "",
+    "Transcript:",
+    transcriptText,
+  ].join("\n");
+}
+
+export function buildProviderRequest(
+  userMessage: string,
+  provider: string,
+  session: BeeSession | null
+): string {
+  const handoff = buildProviderHandoff(session, provider);
+  if (!handoff) return userMessage;
+  return `${handoff}\n\nNew user message:\n${userMessage}`;
 }
 
 export class ChatSession {
@@ -294,8 +378,10 @@ export class ChatSession {
       text: line.text,
       ...(line.meta ? { meta: line.meta } : {}),
       at: now,
+      seq: 0,
     }));
     await this._sessionManager.appendTranscript(this._beeSession, stamped);
+    await this._sessionManager.markProviderSynced(this._beeSession, this.config.provider);
   }
 
   /** Switch active provider for both runtime config and persisted bee session. */
@@ -438,6 +524,7 @@ export class ChatSession {
 
   private async sendClaude(userMessage: string, hooks?: ChatRenderHooks): Promise<string> {
     const model = this.config.model ?? "claude-sonnet-4-6";
+    const requestMessage = buildProviderRequest(userMessage, "claude", this._beeSession);
 
     // Allocate a native session ID on first call
     const isFirstMessage = this._claudeSessionId === null;
@@ -474,7 +561,7 @@ export class ChatSession {
 
     // Prompt goes via stdin (edit mode); prepend classifier so LLM can route to plan flow
     const proc = Bun.spawn(args, {
-      stdin: new Blob([PLAN_INTENT_PREFIX + userMessage]),
+      stdin: new Blob([PLAN_INTENT_PREFIX + requestMessage]),
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -604,19 +691,36 @@ export class ChatSession {
   }
 
   // ── Codex ──────────────────────────────────────────────────────────────────
-  // Uses `codex resume <session-id> <prompt>` for continuation.
+  // Uses `codex exec --json` for non-interactive execution.
+  // Session continuity via `codex exec resume <thread_id>`.
+  //
+  // JSONL event format (from codex exec --json):
+  //   {"type":"thread.started","thread_id":"<uuid>"}
+  //   {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+  //   {"type":"turn.completed","usage":{"input_tokens":N,"output_tokens":N}}
 
   private async sendCodex(userMessage: string, hooks?: ChatRenderHooks): Promise<string> {
     const eventMode = Boolean(hooks);
     const stopSpinner = eventMode ? (() => {}) : startSpinner("thinking…");
+    const requestMessage = buildProviderRequest(userMessage, "codex", this._beeSession);
 
+    // Build args: codex exec [resume <thread_id>] --json --dangerously-bypass-approvals-and-sandbox <prompt>
     let args: string[];
     if (this._codexSessionId) {
-      // Resume existing conversation
-      args = ["codex", "resume", this._codexSessionId, userMessage];
+      args = [
+        "codex", "exec",
+        "resume", this._codexSessionId,
+        "--json",
+        "--dangerously-bypass-approvals-and-sandbox",
+        requestMessage,
+      ];
     } else {
-      // New conversation
-      args = ["codex", "--quiet", userMessage];
+      args = [
+        "codex", "exec",
+        "--json",
+        "--dangerously-bypass-approvals-and-sandbox",
+        requestMessage,
+      ];
     }
 
     const proc = Bun.spawn(args, {
@@ -624,35 +728,71 @@ export class ChatSession {
       stderr: "pipe",
     });
 
-    const text = await new Response(proc.stdout).text();
-    stopSpinner();
-    await proc.exited;
+    // Drain stderr concurrently (codex logs warnings there)
+    const stderrProm = new Response(proc.stderr).text().catch(() => "");
 
-    // Try to capture session ID from codex output/stderr for future resumption
-    const stderrText = await new Response(proc.stderr).text().catch(() => "");
+    const reader = proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let fullText = "";
+    let spinnerStopped = false;
 
-    // Codex prints session info to stderr; try to extract session ID
-    if (!this._codexSessionId) {
-      const match = stderrText.match(/session[_\s]?id[:\s]+([a-f0-9-]+)/i)
-        ?? text.match(/session[_\s]?id[:\s]+([a-f0-9-]+)/i);
-      if (match) {
-        this._codexSessionId = match[1]!;
-        if (this._sessionManager && this._beeSession) {
-          void this._sessionManager.bindNativeId(this._beeSession, "codex", this._codexSessionId);
+    function stopOnce() {
+      if (!spinnerStopped) { stopSpinner(); spinnerStopped = true; }
+    }
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          let ev: { type?: string; thread_id?: string; item?: { type?: string; text?: string }; usage?: { input_tokens?: number; output_tokens?: number } };
+          try { ev = JSON.parse(trimmed); } catch { continue; }
+
+          if (ev.type === "thread.started" && ev.thread_id && !this._codexSessionId) {
+            this._codexSessionId = ev.thread_id;
+            if (this._sessionManager && this._beeSession) {
+              void this._sessionManager.bindNativeId(this._beeSession, "codex", this._codexSessionId);
+            }
+          } else if (ev.type === "item.completed" && ev.item?.type === "agent_message" && ev.item.text) {
+            stopOnce();
+            const chunk = ev.item.text;
+            fullText += chunk;
+            if (eventMode) hooks?.onText?.(chunk);
+            else process.stdout.write(chunk);
+          } else if (ev.type === "turn.completed") {
+            stopOnce();
+          }
         }
       }
+    } finally {
+      reader.releaseLock();
+      stopOnce();
     }
+
+    await proc.exited;
+    const stderrText = await stderrProm;
 
     const authErr = detectAuthError(stderrText, "codex");
     if (authErr) throw new Error(authErr);
-    if (proc.exitCode !== 0 && stderrText.trim()) throw new Error(stderrText.trim());
-
-    const trimmed = text.trim();
-    if (trimmed) {
-      if (eventMode) hooks?.onText?.(trimmed);
-      else process.stdout.write(trimmed);
+    // Only treat as error if we got no output AND exit code is non-zero
+    if (proc.exitCode !== 0 && !fullText.trim()) {
+      // Filter out codex's internal log lines (e.g. ERROR codex_core::...)
+      const stderrClean = stderrText.split("\n")
+        .filter((l) => !l.match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/))
+        .join("\n")
+        .trim();
+      if (stderrClean) throw new Error(stderrClean);
     }
-    return trimmed;
+
+    return fullText.trim();
   }
 
   // ── Kimi ───────────────────────────────────────────────────────────────────
@@ -663,8 +803,9 @@ export class ChatSession {
   private async sendKimi(userMessage: string, hooks?: ChatRenderHooks): Promise<string> {
     const eventMode = Boolean(hooks);
     const stopSpinner = eventMode ? (() => {}) : startSpinner("thinking…");
+    const requestMessage = buildProviderRequest(userMessage, "kimi", this._beeSession);
 
-    const args = ["kimi", "--print", userMessage];
+    const args = ["kimi", "--print", requestMessage];
     if (this._kimiSessionId) {
       // Resume existing session
       args.splice(1, 0, "--session", this._kimiSessionId);

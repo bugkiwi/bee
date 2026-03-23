@@ -16,6 +16,7 @@ import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import { clipboardImageSizeAsync, ensureScreenshotDir, saveClipboardImage } from "../screenshot.ts";
 import { Box, Text, useApp, useFocusManager, useInput, useStdin, useStdout } from "ink";
 import type { WorkspaceConfig } from "../../types/config.ts";
+import type { Plan } from "../../types/plan.ts";
 import type { ChatSession, ChatRenderHooks } from "../chat.ts";
 import { SLASH_COMMANDS, resolveCommand } from "../commands.ts";
 import { resolveClickAction } from "./click-behavior.ts";
@@ -68,6 +69,7 @@ export interface AppProps {
   onProviderPickerRequest: () => Promise<ProviderPickerOptions>;
   onProviderSelected: (provider: string) => Promise<void>;
   onExit: () => string[]; // returns summary lines to display before exit
+  activePlan?: Plan | null;
 }
 
 // ─── App Component ──────────────────────────────────────────────────────────
@@ -82,6 +84,7 @@ export function App({
   onProviderPickerRequest,
   onProviderSelected,
   onExit,
+  activePlan = null,
 }: AppProps) {
   const { exit } = useApp();
   const { focus, focusNext, focusPrevious } = useFocusManager();
@@ -1232,6 +1235,34 @@ export function App({
           />
         ) : renderContentLine(item.line)
       ))}
+      {activePlan && !isExiting ? (
+        <Box flexDirection="column" marginTop={1}>
+          <Text bold>{activePlan.title}</Text>
+          {activePlan.steps.map((step, idx) => {
+            const icon =
+              step.status === "completed" ? "✓" :
+              step.status === "in_progress" ? "▶" :
+              step.status === "failed" ? "✗" :
+              step.status === "skipped" ? "-" : "○";
+            const color =
+              step.status === "completed" ? "green" :
+              step.status === "in_progress" ? "cyan" :
+              step.status === "failed" ? "red" : "gray";
+            return (
+              <Box key={step.id} marginLeft={1}>
+                <Text color={color}>{icon} </Text>
+                <Text
+                  bold={step.status === "in_progress"}
+                  color={step.status === "in_progress" ? "cyan" : undefined}
+                  dimColor={step.status === "pending" || step.status === "skipped"}
+                >
+                  {idx + 1}. {step.description}
+                </Text>
+              </Box>
+            );
+          })}
+        </Box>
+      ) : null}
       {!isExiting && globalStatus ? (
         <StatusBar
           phase={globalStatus.phase}

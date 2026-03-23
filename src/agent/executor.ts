@@ -25,7 +25,8 @@ export class TaskExecutor {
     tracer: Tracer,
     logger: Logger,
     costTracker: CostTracker,
-    attempt: number
+    attempt: number,
+    onToolCall?: (name: string, input: Record<string, unknown>) => void
   ): Promise<{ result: ProviderResult; record: RunRecord }> {
     const providerName = task.provider ?? this.config.provider;
     const provider = this.registry.get(providerName);
@@ -75,7 +76,7 @@ export class TaskExecutor {
       }
     }
 
-    const onEvent = createStreamPrinter(providerName);
+    const onEvent = createStreamPrinter(providerName, onToolCall);
     const result = await provider.execute(enrichedTask, tracer.traceId, onEvent);
 
     const completedAt = new Date().toISOString();
@@ -166,7 +167,7 @@ export class TaskExecutor {
   }
 }
 
-function createStreamPrinter(provider: string): StreamCallback {
+function createStreamPrinter(provider: string, onToolCall?: (name: string, input: Record<string, unknown>) => void): StreamCallback {
   const prefix = chalk.dim(`[${provider}]`);
   return (event: ProviderEvent) => {
     switch (event.type) {
@@ -181,9 +182,12 @@ function createStreamPrinter(provider: string): StreamCallback {
         break;
       }
       case "tool_use": {
-        const e = event.parsed as { tool_use?: { name?: string } };
-        const toolName = e?.tool_use?.name ?? "tool";
+        const e = event.parsed as { tool_use?: { name?: string }; name?: string; input?: Record<string, unknown> };
+        const toolName = e?.tool_use?.name ?? e?.name ?? "tool";
         console.log(`${prefix} ${chalk.cyan(`⚙ ${toolName}`)}`);
+        if (onToolCall) {
+          onToolCall(e?.name ?? toolName, e?.input ?? {});
+        }
         break;
       }
       case "result": {

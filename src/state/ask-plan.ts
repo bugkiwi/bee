@@ -1,12 +1,21 @@
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
 import type { AskPlan, AskPlanNode, AskPlanNodeStatus, AskPlanStatus } from "../types/ask-plan.ts";
+import type { Plan } from "../types/plan.ts";
 import { AskPlanSchema } from "../schema/ask-plan.schema.ts";
 import { readJsonFile, writeJsonFile, listFiles } from "../utils/fs.ts";
 
 export class AskPlanStore {
+  activePlan: Plan | null = null;
+  onChange?: (plan: Plan | null) => void;
+
   constructor(private readonly plansDir: string) {
     mkdirSync(plansDir, { recursive: true });
+  }
+
+  setActivePlan(plan: Plan | null): void {
+    this.activePlan = plan;
+    this.onChange?.(plan);
   }
 
   private filePath(planId: string): string {

@@ -1,4 +1,6 @@
 import { describe, it, expect } from "bun:test";
+import { buildProviderHandoff, buildProviderRequest } from "../cli/chat.ts";
+import type { BeeSession } from "../session/manager.ts";
 
 // ─── detectAuthError (copied inline for unit testing) ────────────────────────
 // The real function lives in chat.ts as a private module-level function.
@@ -162,5 +164,81 @@ describe("No buildPrompt — native session continuation", () => {
     expect(userMessage).toBe("What is 1+1?");
     expect(userMessage).not.toContain("Human:");
     expect(userMessage).not.toContain("Assistant:");
+  });
+});
+
+describe("provider handoff", () => {
+  it("returns null when the target provider is already synced", () => {
+    const session: BeeSession = {
+      id: "s1",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      projectPath: "/tmp/project",
+      activeProvider: "claude",
+      messageCount: 2,
+      transcriptSeq: 2,
+      providers: {
+        claude: {
+          provider: "claude",
+          nativeId: "claude-thread",
+          syncedThrough: 2,
+          tokens: 0,
+          cost: 0,
+          lastActive: "2026-01-01T00:00:00.000Z",
+        },
+      },
+      transcript: [
+        { type: "user", text: "  › fix auth", at: "2026-01-01T00:00:00.000Z", seq: 1 },
+        { type: "assistant", text: "Done", at: "2026-01-01T00:00:01.000Z", seq: 2 },
+      ],
+    };
+
+    expect(buildProviderHandoff(session, "claude")).toBeNull();
+  });
+
+  it("injects only unseen transcript lines for a lagging provider", () => {
+    const session: BeeSession = {
+      id: "s1",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      projectPath: "/tmp/project",
+      activeProvider: "codex",
+      messageCount: 4,
+      transcriptSeq: 4,
+      providers: {
+        claude: {
+          provider: "claude",
+          nativeId: "claude-thread",
+          syncedThrough: 4,
+          tokens: 0,
+          cost: 0,
+          lastActive: "2026-01-01T00:00:00.000Z",
+        },
+        codex: {
+          provider: "codex",
+          nativeId: "codex-thread",
+          syncedThrough: 2,
+          tokens: 0,
+          cost: 0,
+          lastActive: "2026-01-01T00:00:02.000Z",
+        },
+      },
+      transcript: [
+        { type: "user", text: "  › fix auth", at: "2026-01-01T00:00:00.000Z", seq: 1 },
+        { type: "assistant", text: "Done", at: "2026-01-01T00:00:01.000Z", seq: 2 },
+        { type: "user", text: "  › add tests", at: "2026-01-01T00:00:02.000Z", seq: 3 },
+        { type: "assistant", text: "Added parser tests.", at: "2026-01-01T00:00:03.000Z", seq: 4 },
+      ],
+    };
+
+    const handoff = buildProviderHandoff(session, "codex");
+    expect(handoff).toBeTruthy();
+    expect(handoff).not.toContain("fix auth");
+    expect(handoff).toContain("add tests");
+    expect(handoff).toContain("Added parser tests.");
+
+    const request = buildProviderRequest("continue with edge cases", "codex", session);
+    expect(request).toContain("New user message:");
+    expect(request).toContain("continue with edge cases");
   });
 });

@@ -20,6 +20,8 @@ export interface ProviderBinding {
   provider: string;
   /** Native session/conversation ID from the provider CLI */
   nativeId: string | null;
+  /** Highest transcript sequence this provider has already seen */
+  syncedThrough: number;
   /** Tokens consumed on this provider within this session */
   tokens: number;
   /** USD cost on this provider within this session */
@@ -43,6 +45,8 @@ export interface BeeSession {
   providers: Record<string, ProviderBinding>;
   /** Total user messages sent in this session */
   messageCount: number;
+  /** Monotonic transcript sequence counter across the full session */
+  transcriptSeq: number;
   /** Persisted chat transcript lines for session resume rendering. */
   transcript: BeeTranscriptLine[];
 }
@@ -52,6 +56,7 @@ export interface BeeTranscriptLine {
   text: string;
   meta?: TranscriptLineMeta;
   at: string;
+  seq: number;
 }
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
@@ -93,11 +98,34 @@ export class SessionManager {
   }
 
   private normalizeSessionShape(raw: BeeSession): BeeSession {
-    const transcript = Array.isArray((raw as Partial<BeeSession>).transcript)
+    const rawTranscript = Array.isArray((raw as Partial<BeeSession>).transcript)
       ? (raw as Partial<BeeSession>).transcript as BeeTranscriptLine[]
       : [];
+    const transcript = rawTranscript.map((line, index) => ({
+      ...line,
+      seq: typeof line.seq === "number" ? line.seq : index + 1,
+    }));
+    const transcriptSeq =
+      typeof (raw as Partial<BeeSession>).transcriptSeq === "number"
+        ? Math.max((raw as Partial<BeeSession>).transcriptSeq!, transcript.at(-1)?.seq ?? 0)
+        : (transcript.at(-1)?.seq ?? 0);
+    const rawProviders = raw.providers ?? {};
+    const providers = Object.fromEntries(
+      Object.entries(rawProviders).map(([name, binding]) => [
+        name,
+        {
+          ...binding,
+          syncedThrough:
+            typeof binding.syncedThrough === "number"
+              ? Math.min(binding.syncedThrough, transcriptSeq)
+              : (name === raw.activeProvider ? transcriptSeq : 0),
+        },
+      ])
+    );
     return {
       ...raw,
+      providers,
+      transcriptSeq,
       transcript,
     };
   }
@@ -115,12 +143,14 @@ export class SessionManager {
         [provider]: {
           provider,
           nativeId: null,
+          syncedThrough: 0,
           tokens: 0,
           cost: 0,
           lastActive: now,
         },
       },
       messageCount: 0,
+      transcriptSeq: 0,
       transcript: [],
     };
     await this.save(session);
@@ -177,6 +207,7 @@ export class SessionManager {
       session.providers[provider] = {
         provider,
         nativeId,
+        syncedThrough: 0,
         tokens: 0,
         cost: 0,
         lastActive: new Date().toISOString(),
@@ -205,6 +236,7 @@ export class SessionManager {
       session.providers[to] = {
         provider: to,
         nativeId: null,
+        syncedThrough: 0,
         tokens: 0,
         cost: 0,
         lastActive: new Date().toISOString(),
@@ -223,7 +255,15 @@ export class SessionManager {
   async appendTranscript(session: BeeSession, lines: BeeTranscriptLine[]): Promise<void> {
     if (lines.length === 0) return;
     if (!Array.isArray(session.transcript)) session.transcript = [];
-    session.transcript.push(...lines);
+    if (typeof session.transcriptSeq !== "number") {
+      session.transcriptSeq = session.transcript.at(-1)?.seq ?? 0;
+    }
+    session.transcript.push(
+      ...lines.map((line) => ({
+        ...line,
+        seq: ++session.transcriptSeq,
+      }))
+    );
     const MAX_LINES = 2000;
     if (session.transcript.length > MAX_LINES) {
       session.transcript = session.transcript.slice(-MAX_LINES);
@@ -234,11 +274,30 @@ export class SessionManager {
   /** Reset conversation continuity for a session (history + native IDs + counters). */
   async resetConversation(session: BeeSession): Promise<void> {
     session.messageCount = 0;
+    session.transcriptSeq = 0;
     session.transcript = [];
     for (const provider of Object.values(session.providers)) {
       provider.nativeId = null;
+      provider.syncedThrough = 0;
       provider.lastActive = new Date().toISOString();
     }
+    await this.save(session);
+  }
+
+  /** Mark a provider as having seen the transcript through the current sequence. */
+  async markProviderSynced(session: BeeSession, provider: string, seq = session.transcriptSeq): Promise<void> {
+    if (!session.providers[provider]) {
+      session.providers[provider] = {
+        provider,
+        nativeId: null,
+        syncedThrough: 0,
+        tokens: 0,
+        cost: 0,
+        lastActive: new Date().toISOString(),
+      };
+    }
+    session.providers[provider]!.syncedThrough = Math.max(0, Math.min(seq, session.transcriptSeq));
+    session.providers[provider]!.lastActive = new Date().toISOString();
     await this.save(session);
   }
 

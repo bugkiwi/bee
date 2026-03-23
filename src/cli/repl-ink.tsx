@@ -13,6 +13,8 @@ import { TaskLoader } from "../tasks/loader.ts";
 import { StateStore } from "../state/store.ts";
 import { SessionStore } from "../state/session.ts";
 import { AgentLoop } from "../agent/loop.ts";
+import { AskPlanStore } from "../state/ask-plan.ts";
+import type { Plan } from "../types/plan.ts";
 import { ProviderRegistry } from "../providers/registry.ts";
 import { Verifier } from "../verifier/index.ts";
 import { VerificationReporter } from "../verifier/reporter.ts";
@@ -249,7 +251,8 @@ async function handleCommand(
   args: string[],
   config: WorkspaceConfig,
   dirs: { tasks: string; state: string; logs: string; plans: string; config: string },
-  chat: ChatSession
+  chat: ChatSession,
+  sharedAskPlanStore: AskPlanStore
 ): Promise<boolean> {
   switch (cmd) {
     case "help":
@@ -292,7 +295,7 @@ async function handleCommand(
     case "run": {
       const taskId = args.find((a) => !a.startsWith("--"));
       const dryRun = args.includes("--dry-run");
-      const loop = new AgentLoop(config, dirs);
+      const loop = new AgentLoop(config, dirs, { askPlanStore: sharedAskPlanStore });
 
       // Ink mode: no raw stdin prompt; auto-choose fallback provider.
       const onLimitHit = async (provider: string, message: string) => {
@@ -395,7 +398,7 @@ async function handleCommand(
         console.log(chalk.yellow("  No resumable tasks found.\n"));
         break;
       }
-      const loop = new AgentLoop(config, dirs);
+      const loop = new AgentLoop(config, dirs, { askPlanStore: sharedAskPlanStore });
       for (const task of resumable) {
         await loop.run({ taskId: task.task_id, verbose: true });
       }
@@ -584,7 +587,21 @@ export async function runRepl(
     meta: line.meta,
   }));
 
+  // Shared AskPlanStore — one instance for the lifetime of this REPL session.
+  // AgentLoop instances created via handleCommand will share this store so that
+  // activePlan changes are visible here and can be forwarded to the UI.
+  const sharedAskPlanStore = new AskPlanStore(dirs.plans);
+  let activePlan: Plan | null = null;
+
   let viewportEpoch = 0;
+  // inkRef is set after render() so the onChange callback can call rerender.
+  let inkRef: { rerender: (node: React.ReactElement) => void } | null = null;
+
+  sharedAskPlanStore.onChange = (plan) => {
+    activePlan = plan;
+    inkRef?.rerender(appNode());
+  };
+
   const appNode = () => (
     <App
       viewportEpoch={viewportEpoch}
@@ -592,7 +609,8 @@ export async function runRepl(
       chatSession={chatSession}
       initialStatus={initialStatus}
       initialTranscript={initialTranscript}
-      onCommand={(cmd, args) => handleCommand(cmd, args, config, dirs, chatSession)}
+      activePlan={activePlan}
+      onCommand={(cmd, args) => handleCommand(cmd, args, config, dirs, chatSession, sharedAskPlanStore)}
       onProviderPickerRequest={async () => getProviderPickerOptions(config)}
       onProviderSelected={async (provider) => {
         await switchProvider(
@@ -619,6 +637,7 @@ export async function runRepl(
       stderr: renderStream,
       exitOnCtrlC: false,
     });
+    inkRef = ink;
     let resizeTimer: ReturnType<typeof setTimeout> | null = null;
     const repaint = () => {
       if (resizeTimer) clearTimeout(resizeTimer);

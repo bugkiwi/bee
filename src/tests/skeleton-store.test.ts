@@ -121,4 +121,13 @@ describe("SkeletonStore", () => {
     const store = new SkeletonStore(tmpDir);
     expect(store.markNodeDone("nonexistent", "node_001")).rejects.toThrow("Skeleton not found");
   });
+
+  test("save rethrows non-ENOSPC write errors unchanged", async () => {
+    // Point stateDir at a path that cannot be written (file as parent)
+    const store = new SkeletonStore("/dev/null/not-a-dir");
+    const sk = makeSkeleton();
+    // Should throw but NOT wrap as "Disk full" (only ENOSPC gets that treatment)
+    expect(store.save(sk)).rejects.toThrow();
+    expect(store.save(sk)).rejects.not.toThrow("Disk full");
+  });
 });
