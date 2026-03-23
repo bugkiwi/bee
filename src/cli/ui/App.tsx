@@ -60,6 +60,7 @@ import { renderMarkdown } from "./markdown.ts";
 import { extractTerminalEvents } from "./terminal.ts";
 import type {
 	ContentLine,
+	CommandResult,
 	MouseClickEvent,
 	MouseScrollEvent,
 	ProviderPickerOptions,
@@ -72,6 +73,7 @@ import {
 	MAX_HISTORY_ENTRIES,
 	WELCOME_PANEL_ROWS,
 } from "./types.ts";
+import { collectTaskDetailLines } from "../../components/PlanNode.tsx";
 
 const MAX_CONTENT_LINES = 1200;
 const MAX_PLAN_TASK_LOG_LINES = 200;
@@ -88,7 +90,7 @@ export interface AppProps {
 		text: string;
 		meta?: ContentLine["meta"];
 	}>;
-	onCommand: (cmd: string, args: string[]) => Promise<boolean>;
+	onCommand: (cmd: string, args: string[]) => Promise<CommandResult>;
 	onProviderPickerRequest: () => Promise<ProviderPickerOptions>;
 	onProviderSelected: (provider: string) => Promise<void>;
 	onExit: () => string[]; // returns summary lines to display before exit
@@ -131,6 +133,63 @@ function buildDisplayPlan(plan: Plan): Plan {
 			updatedAt,
 		})),
 	};
+}
+
+function countInlinePlanPreviewRows(plan: Plan, terminalWidth: number): number {
+	const width = Math.max(20, terminalWidth);
+
+	function countTaskRows(task: PlanTask, depth: number): number {
+		let rows = 1;
+		const detailLines = collectTaskDetailLines(task);
+		const visibleDetails =
+			detailLines.length > 0
+				? detailLines
+				: depth > 0 && task.description
+					? [task.description]
+					: [];
+		const detailWidth = Math.max(1, width - (8 + depth * 3));
+
+		for (const detailLine of visibleDetails) {
+			rows += rowsForBlock(detailLine, detailWidth);
+		}
+
+		for (const child of task.children ?? []) {
+			rows += countTaskRows(child, depth + 1);
+		}
+
+		return rows;
+	}
+
+	if (plan.tasks.length === 0) return 3;
+	return (
+		2 +
+		plan.tasks.reduce((total, task) => total + countTaskRows(task, 0), 0)
+	);
+}
+
+function countRenderedContentLineRows(
+	line: ContentLine,
+	terminalWidth: number,
+): number {
+	const bodyWidth = getContentBodyWidth(
+		terminalWidth,
+		hasContentLineLeadingColumn(line),
+	);
+	let rows = 0;
+
+	if (line.type === "assistant") {
+		rows += rowsForBlock(renderMarkdown(line.text), bodyWidth);
+	} else {
+		for (const block of getContentLineBlocks(line)) {
+			rows += rowsForBlock(block, bodyWidth);
+		}
+	}
+
+	if (line.meta?.kind === "plan-preview") {
+		rows += countInlinePlanPreviewRows(line.meta.plan, bodyWidth);
+	}
+
+	return rows;
 }
 
 export function capContentLines<T>(
@@ -236,6 +295,13 @@ function getActiveDisplayTaskId(plan: Plan | null): string | null {
 	return flatTasks.at(-1)?.id ?? null;
 }
 
+export function shouldRenderPlanFocusView(
+	plan: Plan | null,
+	isProcessing: boolean,
+): boolean {
+	return Boolean(plan) && isProcessing;
+}
+
 // ─── App Component ──────────────────────────────────────────────────────────
 
 export function App({
@@ -325,6 +391,10 @@ export function App({
 	const activeDisplayTaskId = useMemo(
 		() => getActiveDisplayTaskId(displayPlan),
 		[displayPlan],
+	);
+	const showPlanFocusView = useMemo(
+		() => shouldRenderPlanFocusView(displayPlan, isProcessing),
+		[displayPlan, isProcessing],
 	);
 	const lastLineId = useMemo(() => lines.at(-1)?.id ?? null, [lines]);
 	const processedPlanLineIdRef = useRef<string | null>(null);
@@ -758,17 +828,7 @@ export function App({
 
 		for (const item of renderItems) {
 			if (item.kind === "line") {
-				const bodyWidth = getContentBodyWidth(
-					termWidth,
-					hasContentLineLeadingColumn(item.line),
-				);
-				if (item.line.type === "assistant") {
-					row += rowsForBlock(renderMarkdown(item.line.text), bodyWidth);
-				} else {
-					for (const block of getContentLineBlocks(item.line)) {
-						row += rowsForBlock(block, bodyWidth);
-					}
-				}
+				row += countRenderedContentLineRows(item.line, termWidth);
 				continue;
 			}
 
@@ -1332,14 +1392,33 @@ export function App({
 				setIsProcessing(true);
 				setActiveThinkingLabel(null);
 				await new Promise((resolve) => setTimeout(resolve, 0));
-				let shouldExit = false;
+				let commandResult: CommandResult = {};
 				await streamCapturedOutput(async () => {
-					shouldExit = await onCommand(cmd ?? "", args);
+					commandResult = await onCommand(cmd ?? "", args);
 				});
 
 				setActiveProvider(config.provider);
 
-				if (shouldExit) {
+				const commandLines = commandResult.lines ?? [];
+				if (commandLines.length > 0) {
+					setLines((prev) =>
+						appendCappedLines(
+							prev,
+							commandLines.map((line) => ({
+								id: nextLineId(line.type),
+								text: line.text,
+								type: line.type,
+								...(line.meta ? { meta: line.meta } : {}),
+								...(line.isFirstAssistantInTurn
+									? { isFirstAssistantInTurn: true }
+									: {}),
+							})),
+							MAX_CONTENT_LINES,
+						),
+					);
+				}
+
+				if (commandResult.shouldExit) {
 					doExit();
 					return;
 				}
@@ -1716,6 +1795,10 @@ export function App({
 						: undefined;
 		const bodyDim =
 			line.type === "thinking" || line.type === "tool" || line.type === "shell";
+		const bodyWidth = getContentBodyWidth(
+			Math.max(20, stdout.columns ?? 80),
+			hasLeadingColumn,
+		);
 
 		return (
 			<Box key={line.id} width="100%" flexDirection="column">
@@ -1739,9 +1822,24 @@ export function App({
 						</Box>
 					</Box>
 				))}
+				{line.meta?.kind === "plan-preview" ? (
+					<Box width="100%">
+						<Box
+							width={CONTENT_LABEL_WIDTH}
+							marginRight={CONTENT_LABEL_GAP}
+							flexShrink={0}
+						/>
+						<Box flexGrow={1} flexDirection="column">
+							<PlanTaskTree
+								plans={[line.meta.plan]}
+								terminalWidth={bodyWidth}
+							/>
+						</Box>
+					</Box>
+				) : null}
 			</Box>
 		);
-	}, []);
+	}, [stdout.columns]);
 
 	const scrollbackSnapshotLines = useMemo(() => {
 		if (scrollbackOffset === 0) return [];
@@ -1837,10 +1935,26 @@ export function App({
 						</Text>
 					))}
 				</Box>
-			) : (
-				<>
-					{/* All content lines */}
-					{renderItems.map((item) =>
+				) : showPlanFocusView ? (
+					<Box flexDirection="column" marginTop={1}>
+						<Text color="cyan" bold>
+							Execution Plan
+						</Text>
+						<Text color="gray" dimColor>
+							Live task updates while the run is active.
+						</Text>
+						<Box marginTop={1}>
+							<PlanTaskTree
+								plans={displayPlan ? [displayPlan] : []}
+								taskLogs={planTaskLogs}
+								terminalWidth={Math.max(20, stdout.columns ?? 80)}
+							/>
+						</Box>
+					</Box>
+				) : (
+					<>
+						{/* All content lines */}
+						{renderItems.map((item) =>
 						item.kind === "meta-group" ? (
 							<ThinkingCollapsibleLine
 								key={item.id}
@@ -1875,9 +1989,9 @@ export function App({
 								terminalWidth={Math.max(20, stdout.columns ?? 80)}
 							/>
 						</Box>
-					) : null}
-				</>
-			)}
+						) : null}
+					</>
+				)}
 			{!isExiting && globalStatus ? (
 				<StatusBar
 					phase={globalStatus.phase}

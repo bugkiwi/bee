@@ -1,3 +1,5 @@
+import type { Plan } from "./plan.ts";
+
 /** Metadata attached to a tool-call diff entry in the transcript display. */
 export interface ToolDiffMeta {
   kind: "tool-diff";
@@ -8,4 +10,11 @@ export interface ToolDiffMeta {
   truncated: boolean;
 }
 
-export type TranscriptLineMeta = ToolDiffMeta;
+/** Metadata attached to a rich plan preview rendered inline in the chat transcript. */
+export interface PlanPreviewMeta {
+  kind: "plan-preview";
+  sourcePath: string;
+  plan: Plan;
+}
+
+export type TranscriptLineMeta = ToolDiffMeta | PlanPreviewMeta;

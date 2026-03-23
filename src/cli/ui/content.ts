@@ -111,7 +111,10 @@ export function getContentLineBlocks(line: Pick<ContentLine, "type" | "text" | "
   return blocks.filter((block) => block.length > 0);
 }
 
-export function getCollapsibleMetaGroupType(line: Pick<ContentLine, "type" | "text">): MetaGroupType | null {
+export function getCollapsibleMetaGroupType(
+  line: Pick<ContentLine, "type" | "text" | "meta">
+): MetaGroupType | null {
+  if (line.meta?.kind === "plan-preview") return null;
   if (line.type === "thinking" && isCollapsibleThinkingLine(line.text)) return "thinking";
   if (line.type === "tool" && /\S/.test(getContentLineText(line))) return "tool";
   return null;

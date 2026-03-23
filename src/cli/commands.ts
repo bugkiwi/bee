@@ -31,6 +31,12 @@ export const SLASH_COMMANDS: SlashCommand[] = [
     usage: "/plan <spec-file> [--provider claude|codex|kimi]",
   },
   {
+    name: "plan-preview",
+    alias: "pp",
+    desc: "Render an ask-plan in chat, with linked tasks when available",
+    usage: "/plan-preview [plan-id|plan-file]",
+  },
+  {
     name: "verify",
     alias: "v",
     desc: "Verify task completion (tests + lint + typecheck)",

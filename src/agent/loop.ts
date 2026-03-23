@@ -109,7 +109,9 @@ export class AgentLoop {
     this.stateStore = new StateStore(dirs.state);
     this.sessionStore = new SessionStore(dirs.state);
     this.skeletonStore = new SkeletonStore(dirs.state);
-    this.askPlanStore = stores?.askPlanStore ?? new AskPlanStore(plansDir);
+    this.askPlanStore =
+      stores?.askPlanStore ??
+      new AskPlanStore(plansDir, { tasksDir: dirs.tasks });
     this.executor = new TaskExecutor(config);
     this.retrier = new Retrier({
       max_attempts: config.max_retries,
@@ -239,37 +241,41 @@ export class AgentLoop {
     console.log(chalk.bold("\n⚙  Decomposing plan..."));
     const plan = await this.planner.buildAskPlan(goal, this.config.provider);
 
-    await this.askPlanStore.save(plan);
-    console.log(chalk.gray(`  Plan saved: .bee/plans/ask-${plan.id}.json`));
-
-    // Phase 2: Present plan + user approval
-    if (opts.onPlanReady) {
-      const proceed = await opts.onPlanReady(plan);
-      if (!proceed) {
-        await this.askPlanStore.updateStatus(plan.id, "planning");
-        console.log(chalk.yellow("\nRun aborted. Plan saved — resume with: bee ask --resume " + plan.id));
-        throw new UserAbortError();
-      }
-    }
-
-    // Phase 3: Execute
-    await this.askPlanStore.updateStatus(plan.id, "running");
-
-    const session = await this.sessionStore.init(this.config.provider);
-    let handoffContext = "";
-
     try {
+      await this.askPlanStore.save(plan);
+      console.log(chalk.gray(`  Plan saved: .bee/plans/ask-${plan.id}.json`));
+
+      // Phase 2: Present plan + user approval
+      if (opts.onPlanReady) {
+        const proceed = await opts.onPlanReady(plan);
+        if (!proceed) {
+          await this.askPlanStore.updateStatus(plan.id, "planning");
+          console.log(chalk.yellow("\nRun aborted. Plan saved — resume with: bee ask --resume " + plan.id));
+          throw new UserAbortError();
+        }
+      }
+
+      // Phase 3: Execute
+      await this.askPlanStore.updateStatus(plan.id, "running");
+
+      const session = await this.sessionStore.init(this.config.provider);
+      let handoffContext = "";
+
       for (const node of plan.root_nodes) {
         handoffContext = await this.runAskNode(plan.id, node, handoffContext, session.active_provider, opts);
       }
+      await this.askPlanStore.updateStatus(plan.id, "done");
+      console.log(chalk.green(`\n✅ Ask plan complete: ${goal}`));
+      console.log(chalk.gray(`  Plan: .bee/plans/ask-${plan.id}.json`));
     } catch (err) {
+      if (err instanceof UserAbortError) {
+        throw err;
+      }
       await this.askPlanStore.updateStatus(plan.id, "failed");
       throw err;
+    } finally {
+      this.askPlanStore.setActivePlan(null);
     }
-
-    await this.askPlanStore.updateStatus(plan.id, "done");
-    console.log(chalk.green(`\n✅ Ask plan complete: ${goal}`));
-    console.log(chalk.gray(`  Plan: .bee/plans/ask-${plan.id}.json`));
   }
 
   /**
@@ -312,7 +318,16 @@ export class AgentLoop {
           log: async (_entry) => {},
         };
 
-        const summary = await this.runNode(skNode, handoffContext, provider, opts, noopLogger as SkeletonLogger);
+        const summary = await this.runNode(
+          skNode,
+          handoffContext,
+          provider,
+          opts,
+          noopLogger as SkeletonLogger,
+          async (taskIds) => {
+            await this.askPlanStore.setNodeLeafTasks(planId, node.id, taskIds);
+          },
+        );
 
         // Record leaf task IDs (they were saved to .bee/tasks/ by TaskWriter)
         handoffContext = summary;
@@ -336,7 +351,8 @@ export class AgentLoop {
     handoffContext: string,
     provider: string,
     opts: SkeletonRunOptions,
-    skeletonLogger: SkeletonLogger
+    skeletonLogger: SkeletonLogger,
+    onLeafTasksGenerated?: (taskIds: string[]) => Promise<void>
   ): Promise<string> {
     console.log(chalk.bold(`\n▶ Node: ${node.title}`));
     console.log(chalk.gray(`  ${node.description}`));
@@ -344,6 +360,7 @@ export class AgentLoop {
     // 1. Generate leaf tasks
     const leafTasks = await this.planner.generateLeafTasks(node, handoffContext, provider);
     console.log(chalk.gray(`  Generated ${leafTasks.length} leaf task(s)`));
+    await onLeafTasksGenerated?.(leafTasks.map((task) => task.task_id));
 
     // 2. Execute each leaf
     const completedGoals: string[] = [];
@@ -480,65 +497,119 @@ export class AgentLoop {
       }
     };
 
-    while (keepRunning) {
-      // Execute
-      const { result, record } = await this.executor.execute(
-        { ...task, provider: activeProvider },
-        tracer,
-        logger,
-        costTracker,
-        attempt,
-        onToolCall
-      );
-
-      // Track tokens in session
-      if (result.tokens_input || result.tokens_output) {
-        await this.sessionStore.addTokens(
-          activeProvider,
-          (result.tokens_input ?? 0) + (result.tokens_output ?? 0),
-          result.cost_usd ?? 0
+    try {
+      while (keepRunning) {
+        // Execute
+        const { result, record } = await this.executor.execute(
+          { ...task, provider: activeProvider },
+          tracer,
+          logger,
+          costTracker,
+          attempt,
+          onToolCall
         );
-      }
 
-      state.runs.push(record);
-
-      if (result.success) {
-        // Transition to verifying
-        state.current_status = stateMachine.transition("running", "provider_success");
-        await this.stateStore.save(state);
-        task.status = state.current_status;
-        await this.writer.update(task);
-
-        await logger.log(tracer.emit("verify.start"));
-
-        // Verify
-        const summary = await this.verifier.runAll(task);
-        this.reporter.print(summary);
-
-        const errors = summary.checks
-          .filter((c) => !c.passed)
-          .map((c) => c.error ?? `${c.check} failed`);
-
-        if (summary.passed) {
-          state.current_status = stateMachine.transition("verifying", "verify_pass");
-          state.last_verified_at = new Date().toISOString();
-          record.verification_result = "pass";
-          await this.stateStore.save(state);
-          task.status = "done";
-          await this.writer.update(task);
-          await logger.log(
-            tracer.emit("task.complete", undefined, tracer.elapsed())
+        // Track tokens in session
+        if (result.tokens_input || result.tokens_output) {
+          await this.sessionStore.addTokens(
+            activeProvider,
+            (result.tokens_input ?? 0) + (result.tokens_output ?? 0),
+            result.cost_usd ?? 0
           );
-          console.log(chalk.green(`✓ ${task.task_id} done — ${costTracker.summary()}`));
-          keepRunning = false;
+        }
+
+        state.runs.push(record);
+
+        if (result.success) {
+          // Transition to verifying
+          state.current_status = stateMachine.transition("running", "provider_success");
+          await this.stateStore.save(state);
+          task.status = state.current_status;
+          await this.writer.update(task);
+
+          await logger.log(tracer.emit("verify.start"));
+
+          // Verify
+          const summary = await this.verifier.runAll(task);
+          this.reporter.print(summary);
+
+          const errors = summary.checks
+            .filter((c) => !c.passed)
+            .map((c) => c.error ?? `${c.check} failed`);
+
+          if (summary.passed) {
+            state.current_status = stateMachine.transition("verifying", "verify_pass");
+            state.last_verified_at = new Date().toISOString();
+            record.verification_result = "pass";
+            await this.stateStore.save(state);
+            task.status = "done";
+            await this.writer.update(task);
+            await logger.log(
+              tracer.emit("task.complete", undefined, tracer.elapsed())
+            );
+            console.log(chalk.green(`✓ ${task.task_id} done — ${costTracker.summary()}`));
+            keepRunning = false;
+          } else {
+            state.current_status = stateMachine.transition("verifying", "verify_fail");
+            state.verification_errors = errors;
+            record.verification_result = "fail";
+            await this.stateStore.save(state);
+            task.status = "failed";
+            await this.writer.update(task);
+            await logger.log(tracer.emit("verify.fail", { errors }));
+
+            if (this.retrier.shouldRetry(state)) {
+              attempt++;
+              state.current_status = stateMachine.transition("failed", "retry");
+              await this.stateStore.save(state);
+              await logger.log(tracer.emit("retry.attempt", { attempt }));
+              console.log(chalk.yellow(`  ↺ Retry ${attempt}/${this.config.max_retries}...`));
+              await this.retrier.waitBeforeRetry(attempt);
+              state.current_status = stateMachine.transition("retrying", "resume_run");
+              await this.stateStore.save(state);
+            } else {
+              console.log(chalk.red(`✗ ${task.task_id} failed after ${attempt} attempt(s)`));
+              keepRunning = false;
+            }
+          }
         } else {
-          state.current_status = stateMachine.transition("verifying", "verify_fail");
-          state.verification_errors = errors;
-          record.verification_result = "fail";
+          // Check for limit events (rate limit, budget, auth)
+          const limitEvent = detectLimit(result);
+          if (limitEvent && opts.onLimitHit) {
+            await this.sessionStore.recordLimitEvent(
+              activeProvider,
+              limitEvent.kind,
+              limitEvent.message
+            );
+            console.log(
+              chalk.red(`\n  ⚠ ${limitEvent.kind.replace("_", " ").toUpperCase()}: ${limitEvent.message}`)
+            );
+            const newProvider = await opts.onLimitHit(activeProvider, limitEvent.message);
+            if (newProvider && newProvider !== activeProvider) {
+              console.log(chalk.yellow(`  → Switching to ${chalk.bold(newProvider)}...`));
+              await this.sessionStore.switchProvider(newProvider, limitEvent.message);
+              activeProvider = newProvider;
+              // Reset attempt count for fresh provider, re-enter loop
+              state.current_status = stateMachine.transition(
+                state.current_status === "failed" ? "failed" : "running",
+                "retry"
+              );
+              await this.stateStore.save(state);
+              state.current_status = stateMachine.transition("retrying", "resume_run");
+              await this.stateStore.save(state);
+              continue;
+            }
+          }
+
+          // Provider failure
+          state.current_status = stateMachine.transition("running", "provider_failure");
+          state.verification_errors = [result.error ?? "Provider failed"];
           await this.stateStore.save(state);
           task.status = "failed";
           await this.writer.update(task);
-          await logger.log(tracer.emit("verify.fail", { errors }));
+          await logger.log(
+            tracer.emit("task.fail", { error: result.error }, tracer.elapsed())
+          );
 
           if (this.retrier.shouldRetry(state)) {
             attempt++;
@@ -550,62 +621,14 @@ export class AgentLoop {
             state.current_status = stateMachine.transition("retrying", "resume_run");
             await this.stateStore.save(state);
           } else {
-            console.log(chalk.red(`✗ ${task.task_id} failed after ${attempt} attempt(s)`));
+            console.log(chalk.red(`✗ ${task.task_id} failed: ${result.error}`));
             keepRunning = false;
           }
         }
-      } else {
-        // Check for limit events (rate limit, budget, auth)
-        const limitEvent = detectLimit(result);
-        if (limitEvent && opts.onLimitHit) {
-          await this.sessionStore.recordLimitEvent(
-            activeProvider,
-            limitEvent.kind,
-            limitEvent.message
-          );
-          console.log(
-            chalk.red(`\n  ⚠ ${limitEvent.kind.replace("_", " ").toUpperCase()}: ${limitEvent.message}`)
-          );
-          const newProvider = await opts.onLimitHit(activeProvider, limitEvent.message);
-          if (newProvider && newProvider !== activeProvider) {
-            console.log(chalk.yellow(`  → Switching to ${chalk.bold(newProvider)}...`));
-            await this.sessionStore.switchProvider(newProvider, limitEvent.message);
-            activeProvider = newProvider;
-            // Reset attempt count for fresh provider, re-enter loop
-            state.current_status = stateMachine.transition(
-              state.current_status === "failed" ? "failed" : "running",
-              "retry"
-            );
-            await this.stateStore.save(state);
-            state.current_status = stateMachine.transition("retrying", "resume_run");
-            await this.stateStore.save(state);
-            continue;
-          }
-        }
-
-        // Provider failure
-        state.current_status = stateMachine.transition("running", "provider_failure");
-        state.verification_errors = [result.error ?? "Provider failed"];
-        await this.stateStore.save(state);
-        task.status = "failed";
-        await this.writer.update(task);
-        await logger.log(
-          tracer.emit("task.fail", { error: result.error }, tracer.elapsed())
-        );
-
-        if (this.retrier.shouldRetry(state)) {
-          attempt++;
-          state.current_status = stateMachine.transition("failed", "retry");
-          await this.stateStore.save(state);
-          await logger.log(tracer.emit("retry.attempt", { attempt }));
-          console.log(chalk.yellow(`  ↺ Retry ${attempt}/${this.config.max_retries}...`));
-          await this.retrier.waitBeforeRetry(attempt);
-          state.current_status = stateMachine.transition("retrying", "resume_run");
-          await this.stateStore.save(state);
-        } else {
-          console.log(chalk.red(`✗ ${task.task_id} failed: ${result.error}`));
-          keepRunning = false;
-        }
+      }
+    } finally {
+      if (isInPlanMode) {
+        this.askPlanStore.setActivePlan(null);
       }
     }
   }

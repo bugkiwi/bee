@@ -8,6 +8,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { PlanStatus } from "../types/plan.ts";
 import {
 	appendCappedLines,
 	capContentLines,
@@ -15,6 +16,7 @@ import {
 	extractCapturedOutputChunk,
 	extractScrollbackSnapshotLines,
 	getInputPanelRows,
+	shouldRenderPlanFocusView,
 } from "../cli/ui/App.tsx";
 
 // ─── Import and test getSessionSummaryLines ──────────────────────────────────
@@ -370,5 +372,23 @@ describe("App scrollback helpers", () => {
 		expect(getInputPanelRows(0, 0)).toBe(6);
 		expect(getInputPanelRows(3, 0)).toBe(11);
 		expect(getInputPanelRows(0, 2)).toBe(10);
+	});
+});
+
+describe("App plan focus mode", () => {
+	it("shows the focused task view only while a plan is active and processing", () => {
+		const plan = {
+			id: "plan-1",
+			title: "Focused plan",
+			description: "Focused plan",
+			status: PlanStatus.running,
+			createdAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
+			tasks: [],
+		};
+
+		expect(shouldRenderPlanFocusView(plan, true)).toBe(true);
+		expect(shouldRenderPlanFocusView(plan, false)).toBe(false);
+		expect(shouldRenderPlanFocusView(null, true)).toBe(false);
 	});
 });

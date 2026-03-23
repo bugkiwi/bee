@@ -20,6 +20,7 @@ import { AgentLoop, UserAbortError, NodeFailedError } from "../agent/loop.ts";
 import { DEFAULT_CONFIG } from "../types/config.ts";
 import type { AskPlan } from "../types/ask-plan.ts";
 import type { WorkspaceConfig } from "../types/config.ts";
+import type { AgentTask } from "../types/task.ts";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -64,6 +65,22 @@ const TEST_CONFIG: WorkspaceConfig = {
 function makeLoop(dirs: ReturnType<typeof makeTempDirs>["dirs"]) {
   const loop = new AgentLoop(TEST_CONFIG, dirs);
   return loop;
+}
+
+function makeMockLeafTask(taskId = "task-linked-001"): AgentTask {
+  const now = new Date().toISOString();
+  return {
+    task_id: taskId,
+    goal: "Clamp scrollback offset",
+    steps: [
+      { id: 1, desc: "Add bounds check", status: "pending" },
+    ],
+    acceptance_criteria: ["scrollbackOffset stays within bounds"],
+    tests_required: true,
+    status: "pending",
+    created_at: now,
+    updated_at: now,
+  };
 }
 
 // Stub the private planner to return a fixed plan without LLM
@@ -171,6 +188,91 @@ describe("Plan-mode auto-exit: normal completion", () => {
       const store = new AskPlanStore(dirs.dirs.plans);
       const saved = await store.load(plan.id);
       expect(saved?.status).toBe("done");
+    } finally {
+      rmSync(dirs.base, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Ask plan task linkage", () => {
+  test("runAsk persists generated leaf_task_ids onto the matching ask-plan node", async () => {
+    const dirs = makeTempDirs("ask-linked-tasks");
+    try {
+      const loop = makeLoop(dirs.dirs);
+      const plan = makeMockPlan("plan-linked");
+      const leafTask = makeMockLeafTask("task-scroll-offset");
+
+      (loop as unknown as Record<string, unknown>)["planner"] = {
+        buildAskPlan: async () => plan,
+        generateLeafTasks: async () => [leafTask],
+        generateHandoffSummary: async () => "mock summary",
+      };
+      (loop as unknown as Record<string, unknown>)["runTask"] = async () => {};
+      (loop as unknown as Record<string, unknown>)["sessionStore"] = {
+        init: async () => ({ active_provider: "claude" }),
+        updateContext: async () => {},
+      };
+
+      await expect(loop.runAsk("test goal")).resolves.toBeUndefined();
+
+      const { AskPlanStore } = await import("../state/ask-plan.ts");
+      const store = new AskPlanStore(dirs.dirs.plans);
+      const saved = await store.load(plan.id);
+      expect(saved?.root_nodes[0]?.leaf_task_ids).toEqual([leafTask.task_id]);
+    } finally {
+      rmSync(dirs.base, { recursive: true, force: true });
+    }
+  });
+
+  test("runAsk pushes active plan updates to the shared store and clears them after completion", async () => {
+    const dirs = makeTempDirs("ask-active-plan");
+    try {
+      const { AskPlanStore } = await import("../state/ask-plan.ts");
+      const sharedStore = new AskPlanStore(dirs.dirs.plans, {
+        tasksDir: dirs.dirs.tasks,
+      });
+      const seen: Array<import("../types/plan.ts").Plan | null> = [];
+      sharedStore.onChange = (plan) => {
+        seen.push(plan);
+      };
+
+      const loop = new AgentLoop(TEST_CONFIG, dirs.dirs, {
+        askPlanStore: sharedStore,
+      });
+      const plan = makeMockPlan("plan-active");
+      const leafTask = makeMockLeafTask("task-scroll-offset");
+
+      await Bun.write(
+        join(dirs.dirs.tasks, `${leafTask.task_id}.json`),
+        JSON.stringify(leafTask, null, 2),
+      );
+
+      (loop as unknown as Record<string, unknown>)["planner"] = {
+        buildAskPlan: async () => plan,
+        generateLeafTasks: async () => [leafTask],
+        generateHandoffSummary: async () => "mock summary",
+      };
+      (loop as unknown as Record<string, unknown>)["runTask"] = async () => {};
+      (loop as unknown as Record<string, unknown>)["sessionStore"] = {
+        init: async () => ({ active_provider: "claude" }),
+        updateContext: async () => {},
+      };
+
+      await expect(loop.runAsk("test goal")).resolves.toBeUndefined();
+
+      expect(seen.length).toBeGreaterThan(0);
+      expect(seen.some((snapshot) => snapshot?.status === "running")).toBe(true);
+      expect(
+        seen.some((snapshot) => snapshot?.tasks[0]?.status === "running"),
+      ).toBe(true);
+      expect(
+        seen.some((snapshot) =>
+          snapshot?.tasks[0]?.children?.some(
+            (child) => child.title === "Clamp scrollback offset",
+          ),
+        ),
+      ).toBe(true);
+      expect(seen.at(-1)).toBeNull();
     } finally {
       rmSync(dirs.base, { recursive: true, force: true });
     }

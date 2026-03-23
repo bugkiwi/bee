@@ -1,15 +1,19 @@
-import { join } from "node:path";
 import { mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { AskPlanSchema } from "../schema/ask-plan.schema.ts";
 import type { AskPlan, AskPlanNode, AskPlanNodeStatus, AskPlanStatus } from "../types/ask-plan.ts";
 import type { Plan } from "../types/plan.ts";
-import { AskPlanSchema } from "../schema/ask-plan.schema.ts";
-import { readJsonFile, writeJsonFile, listFiles } from "../utils/fs.ts";
+import { hydrateAskPlanToDisplayPlan } from "../utils/ask-plan-preview.ts";
+import { listFiles, readJsonFile, writeJsonFile } from "../utils/fs.ts";
 
 export class AskPlanStore {
   activePlan: Plan | null = null;
   onChange?: (plan: Plan | null) => void;
 
-  constructor(private readonly plansDir: string) {
+  constructor(
+    private readonly plansDir: string,
+    private readonly options: { tasksDir?: string } = {}
+  ) {
     mkdirSync(plansDir, { recursive: true });
   }
 
@@ -25,6 +29,7 @@ export class AskPlanStore {
   async save(plan: AskPlan): Promise<void> {
     try {
       await writeJsonFile(this.filePath(plan.id), plan);
+      await this.syncActivePlan(plan);
     } catch (err: unknown) {
       const e = err as NodeJS.ErrnoException;
       if (e.code === "ENOSPC") throw new Error("Disk full — cannot save ask plan");
@@ -97,6 +102,14 @@ export class AskPlanStore {
     node.leaf_task_ids = taskIds;
     plan.updated_at = new Date().toISOString();
     await this.save(plan);
+  }
+
+  private async syncActivePlan(plan: AskPlan): Promise<void> {
+    this.setActivePlan(
+      await hydrateAskPlanToDisplayPlan(plan, {
+        tasksDir: this.options.tasksDir,
+      })
+    );
   }
 }
 

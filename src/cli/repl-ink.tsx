@@ -31,6 +31,8 @@ import { existsSync } from "node:fs";
 import { ReplayReader } from "../observability/replay.ts";
 import { App } from "./ui/App.tsx";
 import { clearTerminalScreen, enterAlternateScreen, exitAlternateScreen } from "./ui/terminal.ts";
+import { loadAskPlanPreviewLine } from "../utils/ask-plan-preview.ts";
+import type { CommandResult } from "./ui/types.ts";
 
 // ─── Session summary ──────────────────────────────────────────────────────────
 
@@ -253,12 +255,12 @@ async function handleCommand(
   dirs: { tasks: string; state: string; logs: string; plans: string; config: string },
   chat: ChatSession,
   sharedAskPlanStore: AskPlanStore
-): Promise<boolean> {
+): Promise<CommandResult> {
   switch (cmd) {
     case "help":
       console.log(chalk.bold("\nAvailable commands:\n"));
       const groups = [
-        { label: "Tasks",    cmds: ["status", "tasks", "run", "plan", "verify", "resume", "replay"] },
+        { label: "Tasks",    cmds: ["status", "tasks", "run", "plan", "plan-preview", "verify", "resume", "replay"] },
         { label: "Provider", cmds: ["provider", "switch", "session"] },
         { label: "Info",     cmds: ["config", "logs", "gain"] },
         { label: "Shell",    cmds: ["chat", "clear", "exit"] },
@@ -354,6 +356,26 @@ async function handleCommand(
         provider: providerArg ?? config.provider,
       });
       break;
+    }
+
+    case "plan-preview": {
+      const target = args.find((a) => !a.startsWith("--"));
+      const previewLine = await loadAskPlanPreviewLine(target, {
+        plansDir: dirs.plans,
+        tasksDir: dirs.tasks,
+      });
+      if (!previewLine) {
+        if (target) {
+          console.log(chalk.red(`  Ask plan not found or invalid: ${target}`));
+        } else {
+          console.log(chalk.red("  No ask plan found to preview."));
+        }
+        console.log(
+          chalk.gray("  Usage: /plan-preview [plan-id | ask-*.json | .bee/plans/...]\n"),
+        );
+        break;
+      }
+      return { lines: [previewLine] };
     }
 
     case "ask": {
@@ -554,13 +576,13 @@ async function handleCommand(
       break;
 
     case "exit":
-      return true;
+      return { shouldExit: true };
 
     default:
       console.log(chalk.red(`  Unknown command: /${cmd}`));
       console.log(chalk.gray('  Type /help to see available commands.\n'));
   }
-  return false;
+  return {};
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
@@ -590,7 +612,9 @@ export async function runRepl(
   // Shared AskPlanStore — one instance for the lifetime of this REPL session.
   // AgentLoop instances created via handleCommand will share this store so that
   // activePlan changes are visible here and can be forwarded to the UI.
-  const sharedAskPlanStore = new AskPlanStore(dirs.plans);
+  const sharedAskPlanStore = new AskPlanStore(dirs.plans, {
+    tasksDir: dirs.tasks,
+  });
   let activePlan: Plan | null = null;
 
   let viewportEpoch = 0;

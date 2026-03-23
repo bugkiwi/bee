@@ -9,6 +9,18 @@ export interface ContentLine {
   isFirstAssistantInTurn?: boolean;
 }
 
+export interface CommandRenderLine {
+  text: string;
+  type: ContentLine["type"];
+  meta?: TranscriptLineMeta;
+  isFirstAssistantInTurn?: boolean;
+}
+
+export interface CommandResult {
+  shouldExit?: boolean;
+  lines?: CommandRenderLine[];
+}
+
 export interface ProviderPickerOptions {
   options: string[];
   active: string;
