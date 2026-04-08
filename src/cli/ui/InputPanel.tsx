@@ -2,8 +2,28 @@ import { useEffect, useMemo } from "react";
 import { Box, Text, useFocus, useStdout } from "ink";
 import { TextInput } from "@inkjs/ui";
 import stringWidth from "string-width";
+import type { PlanStatus } from "../../types/plan.ts";
+import type { InputPlanSummary } from "./App.tsx";
 import type { ProviderQuickOption, SlashQuickOption } from "./types.ts";
 import { INPUT_FOCUS_ID } from "./types.ts";
+
+function getPlanStatusMeta(status: PlanStatus): {
+	color: string;
+	label: string;
+} {
+	switch (status) {
+		case "running":
+			return { color: "yellow", label: "▶ running" };
+		case "completed":
+			return { color: "green", label: "✓ done" };
+		case "failed":
+			return { color: "red", label: "× failed" };
+		case "paused":
+			return { color: "cyan", label: "◆ verify" };
+		default:
+			return { color: "gray", label: "• pending" };
+	}
+}
 
 interface InputPanelProps {
   input: string;
@@ -11,6 +31,7 @@ interface InputPanelProps {
   statusDivider: string;
   statusInfo: string;
   suggestions: string[];
+  planSummary?: InputPlanSummary | null;
   isActive: boolean;
   inputDisabled: boolean;
   isProcessing: boolean;
@@ -31,6 +52,7 @@ export function InputPanel({
   statusDivider,
   statusInfo,
   suggestions,
+  planSummary,
   isActive,
   inputDisabled,
   isProcessing,
@@ -46,6 +68,9 @@ export function InputPanel({
 }: InputPanelProps) {
   const { stdout } = useStdout();
   const panelWidth = Math.max(20, (stdout.columns ?? 80) - 2);
+  const planStatusMeta = planSummary
+    ? getPlanStatusMeta(planSummary.taskStatus)
+    : null;
   const { isFocused } = useFocus({
     id: INPUT_FOCUS_ID,
     autoFocus: true,
@@ -92,6 +117,19 @@ export function InputPanel({
           onSubmit={canSubmit && isFocused ? onSubmit : undefined}
         />
       </Box>
+      {planSummary && planStatusMeta ? (
+        <Box marginTop={1} paddingLeft={1} width="100%">
+          <Text wrap="truncate-end">
+            <Text color="cyan" bold>{`◇ plan ${planSummary.planHash}`}</Text>
+            <Text dimColor>{` · `}</Text>
+            <Text color="green">{planSummary.progressLabel}</Text>
+            <Text dimColor>{` · `}</Text>
+            <Text color={planStatusMeta.color}>{planStatusMeta.label}</Text>
+            <Text dimColor>{` · `}</Text>
+            <Text color="white">{planSummary.taskTitle}</Text>
+          </Text>
+        </Box>
+      ) : null}
       {providerOptions.length > 0 ? (
         <Box flexDirection="column" marginTop={1} paddingLeft={2} width="100%">
           {providerOptions.map((opt, index) => {

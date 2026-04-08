@@ -1,11 +1,17 @@
 #!/usr/bin/env bun
 import { buildCli } from "./cli/index.ts";
 import { runRepl as runInkRepl } from "./cli/repl-ink.tsx";
+import { restoreTerminalAfterCrash } from "./cli/ui/terminal.ts";
 import { findWorkspaceRoot, getWorkspaceDirs } from "./utils/workspace.ts";
 import { readJsonFile, fileExists, writeJsonFile } from "./utils/fs.ts";
 import { DEFAULT_CONFIG, type WorkspaceConfig } from "./types/config.ts";
 import { WorkspaceConfigSchema } from "./schema/config.schema.ts";
 import { runFirstRunWizardInk } from "./cli/wizard-ink.tsx";
+import {
+  createCrashLogger,
+  type CrashLogger,
+  installProcessCrashHandlers,
+} from "./observability/crash-logger.ts";
 
 interface InteractiveModeArgs {
   isInteractive: boolean;
@@ -13,6 +19,8 @@ interface InteractiveModeArgs {
   resumeLatest?: boolean;
   error?: string;
 }
+
+let activeCrashLogger: CrashLogger | null = null;
 
 async function loadConfig(configPath: string): Promise<WorkspaceConfig> {
   try {
@@ -85,6 +93,18 @@ function parseInteractiveModeArgs(args: string[]): InteractiveModeArgs {
 
 async function main() {
   const args = process.argv.slice(2);
+  const root = findWorkspaceRoot();
+  const dirs = getWorkspaceDirs(root);
+  const crashLogger = createCrashLogger(dirs.logs);
+  activeCrashLogger = crashLogger;
+  installProcessCrashHandlers(crashLogger, {
+    baseContext: {
+      entry: "main",
+      argv: args,
+      cwd: process.cwd(),
+    },
+    beforeReport: restoreTerminalAfterCrash,
+  });
   const interactiveModeArgs = parseInteractiveModeArgs(args);
 
   if (interactiveModeArgs.isInteractive) {
@@ -92,8 +112,6 @@ async function main() {
       throw new Error(interactiveModeArgs.error);
     }
 
-    const root = findWorkspaceRoot();
-    const dirs = getWorkspaceDirs(root);
     let config = await loadConfig(dirs.config);
     const supportsInk = canUseInkRepl();
 
@@ -116,6 +134,7 @@ async function main() {
       resumeSessionId: interactiveModeArgs.resumeSessionId,
       resumeLatest: interactiveModeArgs.resumeLatest,
       showIntro: shouldShowBeeIntro(),
+      crashLogger,
     });
     return;
   }
@@ -125,6 +144,23 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err);
+  restoreTerminalAfterCrash();
+  const alreadyLogged =
+    err &&
+    typeof err === "object" &&
+    "__beeCrashLogged" in err &&
+    err.__beeCrashLogged === true;
+  if (!alreadyLogged) {
+    const crashLogger =
+      activeCrashLogger ??
+      createCrashLogger(getWorkspaceDirs(findWorkspaceRoot()).logs);
+    const logPath = crashLogger.captureSync(err, {
+      scope: "main.catch",
+      cwd: process.cwd(),
+      argv: process.argv.slice(2),
+    });
+    process.stderr.write(`Bee crash log: ${logPath}\n`);
+  }
+  process.stderr.write(`${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
   process.exit(1);
 });

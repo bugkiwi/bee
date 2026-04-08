@@ -15,7 +15,6 @@
 import {
 	Box,
 	Text,
-	renderToString,
 	useApp,
 	useFocusManager,
 	useInput,
@@ -36,10 +35,10 @@ import {
 	saveClipboardImage,
 } from "../screenshot.ts";
 import { InputPanel } from "./InputPanel.tsx";
+import { QueuePanel } from "./QueuePanel.tsx";
 import { StatusBar, type StatusPhase } from "./StatusBar.tsx";
 import { ThinkingCollapsibleLine } from "./ThinkingCollapsibleLine.tsx";
 import { WelcomePanel } from "./WelcomePanel.tsx";
-import { resolveClickAction } from "./click-behavior.ts";
 import {
 	CONTENT_LABEL_GAP,
 	CONTENT_LABEL_WIDTH,
@@ -57,12 +56,16 @@ import {
 	toInlineSummaryText,
 } from "./content.ts";
 import { renderMarkdown } from "./markdown.ts";
-import { extractTerminalEvents } from "./terminal.ts";
+import {
+	ALTERNATE_SCROLL_MODE_DISABLE,
+	ALTERNATE_SCROLL_MODE_ENABLE,
+	LEGACY_MOUSE_MODE_RESET,
+	sanitizeTerminalInputChunk,
+} from "./terminal.ts";
+import type { CrashLogger } from "../../observability/crash-logger.ts";
 import type {
 	ContentLine,
 	CommandResult,
-	MouseClickEvent,
-	MouseScrollEvent,
 	ProviderPickerOptions,
 	ProviderQuickOption,
 	RenderItem,
@@ -80,10 +83,29 @@ const MAX_PLAN_TASK_LOG_LINES = 200;
 const MAX_CAPTURE_TAIL_CHARS = 8192;
 const SCROLLBACK_STEP_LINES = 4;
 
+export interface InputPlanSummary {
+	planHash: string;
+	progressLabel: string;
+	taskTitle: string;
+	taskStatus: PlanStatus;
+}
+
+export interface QueuedInputItem {
+	id: string;
+	text: string;
+	createdAt: string;
+}
+
+export interface ScrollbackState {
+	offset: number;
+	snapshotLines: string[];
+}
+
 export interface AppProps {
 	viewportEpoch: number;
 	config: WorkspaceConfig;
 	chatSession: ChatSession;
+	crashLogger?: CrashLogger;
 	initialStatus: string[];
 	initialTranscript?: Array<{
 		type: "user" | "assistant" | "tool" | "thinking" | "error";
@@ -192,6 +214,150 @@ function countRenderedContentLineRows(
 	return rows;
 }
 
+const SNAPSHOT_STATUS_META: Record<
+	PlanStatus,
+	{ icon: string; label: string }
+> = {
+	completed: { icon: "✓", label: "DONE" },
+	failed: { icon: "×", label: "FAILED" },
+	paused: { icon: "◆", label: "VERIFY" },
+	pending: { icon: "•", label: "PENDING" },
+	running: { icon: "▶", label: "RUNNING" },
+};
+
+function getSnapshotTaskKind(task: PlanTask, depth: number): "plan" | "task" {
+	return task.kind ?? (depth === 0 ? "plan" : "task");
+}
+
+function getSnapshotTreePrefix(
+	ancestorHasNext: boolean[],
+	isLast: boolean,
+	marker: string,
+): string {
+	const rail = ancestorHasNext
+		.map((hasNext) => (hasNext ? "│  " : "   "))
+		.join("");
+	return `${rail}${isLast ? "└─ " : "├─ "}${marker} `;
+}
+
+function buildPlanSnapshotTaskLines(
+	task: PlanTask,
+	depth: number,
+	isLast: boolean,
+	ancestorHasNext: boolean[],
+	taskLogs?: Record<string, string[]>,
+): string[] {
+	const kind = getSnapshotTaskKind(task, depth);
+	const children = task.children ?? [];
+	const marker = children.length > 0 ? "▾" : "▸";
+	const status = SNAPSHOT_STATUS_META[task.status];
+	const lines = [
+		`${getSnapshotTreePrefix(ancestorHasNext, isLast, marker)}[ ${kind.toUpperCase()} ] ${task.title} [ ${status.icon} ${status.label} ]`,
+	];
+	const detailPrefix =
+		ancestorHasNext.map((hasNext) => (hasNext ? "│  " : "   ")).join("") +
+		`${isLast ? "   " : "│  "}   `;
+	for (const detail of collectTaskDetailLines(task, taskLogs)) {
+		lines.push(`${detailPrefix}✓ ${detail}`);
+	}
+	for (const [index, child] of children.entries()) {
+		lines.push(
+			...buildPlanSnapshotTaskLines(
+				child,
+				depth + 1,
+				index === children.length - 1,
+				[...ancestorHasNext, !isLast],
+				taskLogs,
+			),
+		);
+	}
+	return lines;
+}
+
+export function buildPlanSnapshotLines(
+	plan: Plan,
+	taskLogs?: Record<string, string[]>,
+): string[] {
+	const status = SNAPSHOT_STATUS_META[plan.status];
+	const lines = [`◇ ${plan.title} [ ${status.icon} ${status.label} ]`];
+	lines.push("─".repeat(32));
+	if (plan.tasks.length === 0) {
+		lines.push("No plan nodes yet.");
+		return lines;
+	}
+	for (const [index, task] of plan.tasks.entries()) {
+		lines.push(
+			...buildPlanSnapshotTaskLines(
+				task,
+				0,
+				index === plan.tasks.length - 1,
+				[],
+				taskLogs,
+			),
+		);
+	}
+	return lines;
+}
+
+function serializeContentLineForSnapshot(line: ContentLine): string[] {
+	const body =
+		line.type === "assistant"
+			? stripAnsi(renderMarkdown(line.text))
+			: getContentLineBlocks(line)
+					.map((block) => stripAnsi(block))
+					.join("\n");
+	const bodyLines = body.split("\n");
+	const label = line.isFirstAssistantInTurn ? "›" : getContentLineLabel(line);
+	const serialized =
+		label && bodyLines.length > 0
+			? bodyLines.map((bodyLine, index) =>
+					index === 0 ? `${label} ${bodyLine}` : `  ${bodyLine}`,
+				)
+			: bodyLines;
+	if (line.meta?.kind === "plan-preview") {
+		return [...serialized, ...buildPlanSnapshotLines(line.meta.plan)];
+	}
+	return serialized;
+}
+
+export function buildScrollbackSnapshotLines(
+	renderItems: RenderItem[],
+	options: {
+		displayPlan: Plan | null;
+		planTaskLogs: Record<string, string[]>;
+		expandedThinkingIds: Set<string>;
+		isProcessing: boolean;
+		streamingMetaGroupId: string | null;
+	},
+): string[] {
+	const lines: string[] = [];
+	for (const item of renderItems) {
+		if (item.kind === "line") {
+			lines.push(...serializeContentLineForSnapshot(item.line));
+			continue;
+		}
+		const expanded = options.expandedThinkingIds.has(item.id);
+		const isStreaming =
+			options.isProcessing && options.streamingMetaGroupId === item.id;
+		const { summary, full, truncated, summarySource } = summarizeMetaGroup(
+			item.lines,
+		);
+		lines.push(stripAnsi(getMetaSummaryLine(summary, expanded, isStreaming)));
+		if (!expanded) continue;
+		if (truncated) {
+			lines.push(...stripAnsi(full).split("\n"));
+		}
+		for (const line of item.lines) {
+			if (line.id === summarySource?.id) continue;
+			lines.push(...serializeContentLineForSnapshot(line));
+		}
+	}
+	if (options.displayPlan) {
+		lines.push(...buildPlanSnapshotLines(options.displayPlan, options.planTaskLogs));
+	}
+	return lines.map((line) => line.trimEnd());
+}
+
 export function capContentLines<T>(
 	lines: T[],
 	maxLines = MAX_CONTENT_LINES,
@@ -234,6 +400,7 @@ export function extractCapturedOutputChunk(
 export function getInputPanelRows(
 	providerOptionCount: number,
 	slashOptionCount: number,
+	hasPlanSummary = false,
 ): number {
 	const optionsRows =
 		providerOptionCount > 0
@@ -242,7 +409,14 @@ export function getInputPanelRows(
 				? 1 + slashOptionCount + 1
 				: 0;
 
-	return 1 + 1 + 1 + optionsRows + 1 + 1 + 1;
+	return 1 + 1 + 1 + optionsRows + 1 + 1 + 1 + (hasPlanSummary ? 1 : 0);
+}
+
+export function getQueuePanelRows(queueCount: number): number {
+	if (queueCount === 0) return 0;
+	const previewCount = Math.min(3, queueCount);
+	const hiddenCount = queueCount > previewCount ? 1 : 0;
+	return 1 + previewCount + hiddenCount;
 }
 
 export function computeScrollbackWindow(
@@ -256,6 +430,77 @@ export function computeScrollbackWindow(
 	const end = Math.max(0, totalLines - clampedOffset);
 	const start = Math.max(0, end - visibleWindow);
 	return [start, end];
+}
+
+export function enqueueQueuedInput(
+	queue: QueuedInputItem[],
+	text: string,
+): QueuedInputItem[] {
+	return [
+		...queue,
+		{
+			id: `queued-${crypto.randomUUID()}`,
+			text,
+			createdAt: new Date().toISOString(),
+		},
+	];
+}
+
+export function dequeueQueuedInput(queue: QueuedInputItem[]): {
+	next: QueuedInputItem | null;
+	rest: QueuedInputItem[];
+} {
+	const [next, ...rest] = queue;
+	return {
+		next: next ?? null,
+		rest,
+	};
+}
+
+export function advanceScrollbackState(
+	state: ScrollbackState,
+	direction: "up" | "down",
+	step = SCROLLBACK_STEP_LINES,
+	nextSnapshotLines: string[] | null = null,
+): ScrollbackState {
+	if (direction === "up") {
+		return {
+			offset: state.offset + step,
+			snapshotLines:
+				state.offset === 0 ? nextSnapshotLines ?? state.snapshotLines : state.snapshotLines,
+		};
+	}
+
+	const nextOffset = Math.max(0, state.offset - step);
+	return {
+		offset: nextOffset,
+		snapshotLines: nextOffset === 0 ? [] : state.snapshotLines,
+	};
+}
+
+export function shouldCaptureScrollbackSnapshot(
+	state: ScrollbackState,
+): boolean {
+	return state.offset > 0 && state.snapshotLines.length === 0;
+}
+
+export function clampScrollbackState(
+	state: ScrollbackState,
+	maxOffset: number,
+): ScrollbackState {
+	if (state.offset === 0 || state.snapshotLines.length === 0) {
+		return state;
+	}
+
+	const nextOffset = Math.min(state.offset, Math.max(0, maxOffset));
+	if (nextOffset === state.offset) {
+		return state;
+	}
+
+	return {
+		offset: nextOffset,
+		snapshotLines: nextOffset === 0 ? [] : state.snapshotLines,
+	};
 }
 
 export function extractScrollbackSnapshotLines(snapshot: string): string[] {
@@ -295,6 +540,42 @@ function getActiveDisplayTaskId(plan: Plan | null): string | null {
 	return flatTasks.at(-1)?.id ?? null;
 }
 
+export function formatPlanSummaryHash(planId: string): string {
+	const matches = [...planId.matchAll(/[a-f0-9]{8,}/gi)];
+	const hash = matches.at(-1)?.[0];
+	if (hash) return hash.slice(0, 8).toLowerCase();
+	return planId.length > 8 ? planId.slice(0, 8) : planId;
+}
+
+export function buildInputPlanSummary(plan: Plan | null): InputPlanSummary | null {
+	if (!plan) return null;
+
+	const flatTasks = flattenPlanTasks(plan.tasks);
+	if (flatTasks.length === 0) {
+		return {
+			planHash: formatPlanSummaryHash(plan.id),
+			progressLabel: "task 0/0",
+			taskTitle: plan.title,
+			taskStatus: plan.status,
+		};
+	}
+
+	const activeTaskId = getActiveDisplayTaskId(plan);
+	const activeTaskIndex = Math.max(
+		0,
+		flatTasks.findIndex((task) => task.id === activeTaskId),
+	);
+	const activeTask = flatTasks[activeTaskIndex] ?? flatTasks[0];
+	if (!activeTask) return null;
+
+	return {
+		planHash: formatPlanSummaryHash(plan.id),
+		progressLabel: `task ${activeTaskIndex + 1}/${flatTasks.length}`,
+		taskTitle: activeTask.title,
+		taskStatus: activeTask.status,
+	};
+}
+
 export function shouldRenderPlanFocusView(
 	plan: Plan | null,
 	isProcessing: boolean,
@@ -308,6 +589,7 @@ export function App({
 	viewportEpoch,
 	config,
 	chatSession,
+	crashLogger,
 	initialStatus,
 	initialTranscript = [],
 	onCommand,
@@ -359,6 +641,7 @@ export function App({
 	const [isProcessing, setIsProcessing] = useState(false);
 	const [isExiting, setIsExiting] = useState(false);
 	const [activeProvider, setActiveProvider] = useState(config.provider);
+	const [queuedInputs, setQueuedInputs] = useState<QueuedInputItem[]>([]);
 	const [history, setHistory] = useState<string[]>(() => initialInputHistory);
 	const [historyIdx, setHistoryIdx] = useState(-1);
 	const [savedInput, setSavedInput] = useState("");
@@ -366,7 +649,10 @@ export function App({
 		useState<ProviderPickerOptions | null>(null);
 	const [providerPickerIndex, setProviderPickerIndex] = useState(0);
 	const [inputFocused, setInputFocused] = useState(true);
-	const [scrollbackOffset, setScrollbackOffset] = useState(0);
+	const [scrollback, setScrollback] = useState<ScrollbackState>({
+		offset: 0,
+		snapshotLines: [],
+	});
 	const [focusedThinkingId, setFocusedThinkingId] = useState<string | null>(
 		null,
 	);
@@ -379,8 +665,13 @@ export function App({
 		null,
 	);
 	const [hasAssistantStream, setHasAssistantStream] = useState(false);
-	const mouseRemainderRef = useRef("");
-	const cursorRowRef = useRef<number | null>(null);
+	const queueDrainInFlightRef = useRef(false);
+	const captureScrollbackSnapshotLinesRef = useRef<(() => string[]) | null>(
+		null,
+	);
+	const terminalInputRemainderRef = useRef("");
+	const scrollbackOffset = scrollback.offset;
+	const scrollbackSnapshotLines = scrollback.snapshotLines;
 	const displayPlan = useMemo(
 		() => (activePlan ? buildDisplayPlan(activePlan) : null),
 		[activePlan],
@@ -392,9 +683,17 @@ export function App({
 		() => getActiveDisplayTaskId(displayPlan),
 		[displayPlan],
 	);
+	const inputPlanSummary = useMemo(() => {
+		if (!displayPlan || displayPlan.status === PlanStatus.completed) return null;
+		return buildInputPlanSummary(displayPlan);
+	}, [displayPlan]);
 	const showPlanFocusView = useMemo(
 		() => shouldRenderPlanFocusView(displayPlan, isProcessing),
 		[displayPlan, isProcessing],
+	);
+	const queuePanelRows = useMemo(
+		() => getQueuePanelRows(queuedInputs.length),
+		[queuedInputs.length],
 	);
 	const lastLineId = useMemo(() => lines.at(-1)?.id ?? null, [lines]);
 	const processedPlanLineIdRef = useRef<string | null>(null);
@@ -542,6 +841,26 @@ export function App({
 		renderItems,
 	]);
 
+	useEffect(() => {
+		crashLogger?.updateContext({
+			activeProvider,
+			activePlanId: displayPlan?.id ?? null,
+			queueDepth: queuedInputs.length,
+			queueItems: queuedInputs.map((item) => item.text),
+			isProcessing,
+			hasProviderPicker: Boolean(providerPicker),
+			scrollbackOffset,
+		});
+	}, [
+		activeProvider,
+		crashLogger,
+		displayPlan?.id,
+		isProcessing,
+		providerPicker,
+		queuedInputs,
+		scrollbackOffset,
+	]);
+
 	// ── Helpers ────────────────────────────────────────────────────────────────
 
 	const addLine = useCallback(
@@ -608,11 +927,11 @@ export function App({
 	}, []);
 
 	const handleInputChange = useCallback(
-		(next: string) => {
-			if (scrollbackOffset > 0) {
-				setScrollbackOffset(0);
-			}
-			setInput(next);
+			(next: string) => {
+				if (scrollbackOffset > 0) {
+					setScrollback({ offset: 0, snapshotLines: [] });
+				}
+				setInput(next);
 			setSlashQuickDismissed(false);
 			setSlashQuickIndex(0);
 		},
@@ -641,11 +960,8 @@ export function App({
 	const focusInput = useCallback(() => {
 		setTimeout(() => {
 			focus(INPUT_FOCUS_ID);
-			if (mouseCaptureEnabled) {
-				writeTerminal("\u001b[6n");
-			}
 		}, 0);
-	}, [focus, mouseCaptureEnabled, writeTerminal]);
+	}, [focus]);
 
 	const toggleThinkingGroup = useCallback((groupId: string) => {
 		setExpandedThinkingIds((prev) => {
@@ -685,11 +1001,14 @@ export function App({
 	// ── Graceful exit: show summary then quit ──────────────────────────────────
 
 	const doExit = useCallback(() => {
+		crashLogger?.addBreadcrumb("app.exit.requested", {
+			queueDepth: queuedInputs.length,
+		});
 		const summaryLines = onExit();
-		setIsExiting(true);
-		setIsProcessing(true); // hide input
-		setProviderPicker(null);
-		setScrollbackOffset(0);
+			setIsExiting(true);
+			setIsProcessing(true); // hide input
+			setProviderPicker(null);
+			setScrollback({ offset: 0, snapshotLines: [] });
 		setLines((prev) =>
 			appendCappedLines(
 				prev,
@@ -701,7 +1020,30 @@ export function App({
 				MAX_CONTENT_LINES,
 			),
 		);
-	}, [nextLineId, onExit]);
+	}, [crashLogger, nextLineId, onExit, queuedInputs.length]);
+
+	const reportRuntimeError = useCallback(
+		async (
+			scope: string,
+			error: unknown,
+			context: Record<string, unknown> = {},
+		): Promise<void> => {
+			const logPath = crashLogger
+				? await crashLogger.capture(error, {
+						scope,
+						...context,
+					})
+				: null;
+			const message = error instanceof Error ? error.message : String(error);
+			addLine(
+				logPath
+					? `  Bee error: ${message} · crash log: ${logPath}`
+					: `  Bee error: ${message}`,
+				"error",
+			);
+		},
+		[addLine, crashLogger],
+	);
 
 	// After summary lines render, exit on next tick
 	useEffect(() => {
@@ -800,8 +1142,10 @@ export function App({
 			getInputPanelRows(
 				providerPicker ? providerQuickOptions.length : 0,
 				slashQuickOptionsVisible ? slashQuickOptions.length : 0,
+				Boolean(inputPlanSummary),
 			),
 		[
+			inputPlanSummary,
 			providerPicker,
 			providerQuickOptions.length,
 			slashQuickOptions.length,
@@ -815,84 +1159,28 @@ export function App({
 				(stdout.rows ?? 24) -
 					WELCOME_PANEL_ROWS -
 					inputPanelRows -
+					queuePanelRows -
 					(globalStatus ? 1 : 0),
 			),
-		[globalStatus, inputPanelRows, stdout.rows],
+		[globalStatus, inputPanelRows, queuePanelRows, stdout.rows],
 	);
-
-	const clickLayout = useMemo(() => {
-		const termWidth = Math.max(20, stdout.columns ?? 80);
-		const thinkingRanges: Array<{ id: string; start: number; end: number }> =
-			[];
-		let row = WELCOME_PANEL_ROWS + 1;
-
-		for (const item of renderItems) {
-			if (item.kind === "line") {
-				row += countRenderedContentLineRows(item.line, termWidth);
-				continue;
-			}
-
-			const lines = item.lines;
-			const expanded = expandedThinkingIds.has(item.id);
-			const bodyWidth = getContentBodyWidth(termWidth, true);
-			const { summary, full, truncated, summarySource } =
-				summarizeMetaGroup(lines);
-			const isStreamingGroup = isProcessing && streamingMetaGroupId === item.id;
-
-			let h = 0;
-			h += rowsForBlock(
-				getMetaSummaryLine(summary, expanded, isStreamingGroup),
-				bodyWidth,
-			);
-
-			if (expanded) {
-				h += 1;
-				if (truncated) h += rowsForBlock(full, bodyWidth);
-				for (const line of lines) {
-					if (line.id === summarySource?.id) continue;
-					for (const block of getContentLineBlocks(line)) {
-						h += rowsForBlock(block, bodyWidth);
-					}
-				}
-			}
-
-			const start = row;
-			const end = row + h - 1;
-			thinkingRanges.push({ id: item.id, start, end });
-			row = end + 1;
-		}
-
-		const contentRows = row - 1;
-		const inputStart = contentRows + 1;
-		const inputEnd = contentRows + inputPanelRows;
-		const inputCursorRow = contentRows + 3;
-
-		return {
-			totalRows: inputEnd,
-			inputStart,
-			inputEnd,
-			inputCursorRow,
-			thinkingRanges,
-		};
-	}, [
-		expandedThinkingIds,
-		renderItems,
-		inputPanelRows,
-		stdout.columns,
-		isProcessing,
-		streamingMetaGroupId,
-	]);
 
 	const adjustScrollback = useCallback(
 		(
-			direction: MouseScrollEvent["direction"],
+			direction: "up" | "down",
 			step = SCROLLBACK_STEP_LINES,
 		) => {
-			setScrollbackOffset((prev) => {
-				if (direction === "up") {
-					return prev + step;
-				}
-				return Math.max(0, prev - step);
+			setScrollback((prev) => {
+				const nextSnapshotLines =
+					direction === "up" && prev.offset === 0
+						? captureScrollbackSnapshotLinesRef.current?.() ?? prev.snapshotLines
+						: null;
+				return advanceScrollbackState(
+					prev,
+					direction,
+					step,
+					nextSnapshotLines,
+				);
 			});
 		},
 		[],
@@ -985,9 +1273,9 @@ export function App({
 	);
 
 	const openProviderPicker = useCallback(async () => {
-		setIsProcessing(true);
-		setScrollbackOffset(0);
-		const picker = await onProviderPickerRequest();
+			setIsProcessing(true);
+			setScrollback({ offset: 0, snapshotLines: [] });
+			const picker = await onProviderPickerRequest();
 		if (picker.options.length === 0) {
 			addLine("  No providers available.", "system");
 			setIsProcessing(false);
@@ -999,21 +1287,21 @@ export function App({
 		setIsProcessing(false);
 	}, [addLine, focusInput, onProviderPickerRequest]);
 
-	const closeProviderPicker = useCallback(() => {
-		setProviderPicker(null);
-		setProviderPickerIndex(0);
-		setScrollbackOffset(0);
-		focusInput();
-	}, [focusInput]);
+		const closeProviderPicker = useCallback(() => {
+			setProviderPicker(null);
+			setProviderPickerIndex(0);
+			setScrollback({ offset: 0, snapshotLines: [] });
+			focusInput();
+		}, [focusInput]);
 
 	const submitProviderPicker = useCallback(
 		async (index: number) => {
 			if (!providerPicker) return;
 
-			const chosen = providerPicker.options[index];
-			setProviderPicker(null);
-			setProviderPickerIndex(0);
-			setScrollbackOffset(0);
+				const chosen = providerPicker.options[index];
+				setProviderPicker(null);
+				setProviderPickerIndex(0);
+				setScrollback({ offset: 0, snapshotLines: [] });
 
 			if (!chosen) {
 				focusInput();
@@ -1045,239 +1333,54 @@ export function App({
 		],
 	);
 
-	const handleMouseClick = useCallback(
-		(event: MouseClickEvent) => {
-			if (scrollbackOffset > 0) {
-				focusInput();
-				return;
-			}
-
-			const policyActions = resolveClickAction(
-				{
-					isExiting,
-					hasProviderPicker: Boolean(providerPicker),
-					hasSlashQuickOptions: slashQuickOptionsVisible,
-				},
-				{
-					shift: event.shift,
-					ctrl: event.ctrl,
-					meta: event.meta,
-				},
-			);
-
-			for (const action of policyActions) {
-				if (action === "none") return;
-				if (action === "hit-test") continue;
-				if (action === "close-provider-picker") {
-					closeProviderPicker();
-					return;
-				}
-				if (action === "dismiss-slash-quick-options") {
-					setSlashQuickDismissed(true);
-					continue;
-				}
-				if (action === "focus-input") {
-					focusInput();
-					return;
-				}
-				if (action === "focus-next") {
-					focusNext();
-					return;
-				}
-				if (action === "focus-previous") {
-					focusPrevious();
-					return;
-				}
-			}
-
-			const cursorRow = cursorRowRef.current;
-			if (!cursorRow) {
-				focusInput();
-				return;
-			}
-
-			const appTopRow = cursorRow - clickLayout.inputCursorRow + 1;
-			const relativeRow = event.y - appTopRow + 1;
-
-			if (
-				relativeRow >= clickLayout.inputStart &&
-				relativeRow <= clickLayout.inputEnd
-			) {
-				focusInput();
-				return;
-			}
-
-			const targetThinking = clickLayout.thinkingRanges.find(
-				(range) => relativeRow >= range.start && relativeRow <= range.end,
-			);
-			if (targetThinking) {
-				if (focusedThinkingId === targetThinking.id) {
-					toggleThinkingGroup(targetThinking.id);
-				} else {
-					focus(`meta-${targetThinking.id}`);
-				}
-				return;
-			}
-
-			focusInput();
-		},
-		[
-			clickLayout.inputCursorRow,
-			clickLayout.inputEnd,
-			clickLayout.inputStart,
-			clickLayout.thinkingRanges,
-			closeProviderPicker,
-			focus,
-			focusInput,
-			focusNext,
-			focusPrevious,
-			focusedThinkingId,
-			isExiting,
-			providerPicker,
-			scrollbackOffset,
-			slashQuickOptionsVisible,
-			toggleThinkingGroup,
-		],
-	);
-	const handleMouseClickRef = useRef(handleMouseClick);
-
-	useEffect(() => {
-		handleMouseClickRef.current = handleMouseClick;
-	}, [handleMouseClick]);
-
-	const handleMouseScroll = useCallback(
-		(event: MouseScrollEvent) => {
-			if (isExiting) return;
-
-			if (scrollbackOffset > 0) {
-				adjustScrollback(event.direction);
-				return;
-			}
-
-			let inInputArea = false;
-			const cursorRow = cursorRowRef.current;
-			if (cursorRow !== null) {
-				const appTopRow = cursorRow - clickLayout.inputCursorRow + 1;
-				const relativeRow = event.y - appTopRow + 1;
-				inInputArea =
-					relativeRow >= clickLayout.inputStart &&
-					relativeRow <= clickLayout.inputEnd;
-			}
-
-			if (!inInputArea) {
-				adjustScrollback(event.direction);
-				return;
-			}
-
-			// Scroll inside input (or unknown position): history navigation
-			if (
-				providerPicker ||
-				slashQuickOptionsVisible ||
-				isProcessing ||
-				!inputFocused
-			)
-				return;
-
-			if (event.direction === "up") {
-				if (historyIdx === -1 && history.length > 0) {
-					setSavedInput(input);
-					setHistoryIdx(0);
-					const firstHistoryEntry = history[0];
-					if (firstHistoryEntry !== undefined) {
-						replaceInput(firstHistoryEntry);
-					}
-				} else if (historyIdx >= 0 && historyIdx < history.length - 1) {
-					const next = historyIdx + 1;
-					const nextHistoryEntry = history[next];
-					if (nextHistoryEntry === undefined) return;
-					setHistoryIdx(next);
-					replaceInput(nextHistoryEntry);
-				}
-			} else {
-				if (historyIdx > 0) {
-					const next = historyIdx - 1;
-					const nextHistoryEntry = history[next];
-					if (nextHistoryEntry === undefined) return;
-					setHistoryIdx(next);
-					replaceInput(nextHistoryEntry);
-				} else if (historyIdx === 0) {
-					setHistoryIdx(-1);
-					replaceInput(savedInput);
-					setSavedInput("");
-				}
-			}
-		},
-		[
-			clickLayout.inputCursorRow,
-			clickLayout.inputEnd,
-			clickLayout.inputStart,
-			history,
-			historyIdx,
-			input,
-			inputFocused,
-			adjustScrollback,
-			isExiting,
-			isProcessing,
-			providerPicker,
-			replaceInput,
-			scrollbackOffset,
-			savedInput,
-			slashQuickOptionsVisible,
-		],
-	);
-
-	const handleMouseScrollRef = useRef(handleMouseScroll);
-
-	useEffect(() => {
-		handleMouseScrollRef.current = handleMouseScroll;
-	}, [handleMouseScroll]);
-
+	// ── Alternate scroll mode + Ctrl+V clipboard interception ────────────────
+	// 1007h = alternate scroll: wheel events become cursor-key sequences,
+	// while native text selection (drag) is preserved.
 	useEffect(() => {
 		if (!mouseCaptureEnabled || !isRawModeSupported || !stdin.isTTY) return;
 
-		const enableMouse = "\u001b[?1000h\u001b[?1006h";
-		const disableMouse = "\u001b[?1000l\u001b[?1006l";
-		writeTerminal(enableMouse);
-		writeTerminal("\u001b[6n");
+		writeTerminal(`${LEGACY_MOUSE_MODE_RESET}${ALTERNATE_SCROLL_MODE_DISABLE}`);
+		writeTerminal(ALTERNATE_SCROLL_MODE_ENABLE);
+
+		// Intercept Ctrl+V (\x16) when a clipboard image is pending
 		const originalRead = stdin.read.bind(stdin);
 		const patchedRead = ((...args: unknown[]) => {
-			const chunk = originalRead(...(args as Parameters<typeof originalRead>));
-			if (chunk === null) return null;
-			const data = typeof chunk === "string" ? chunk : chunk.toString("utf8");
-			const { clean, clicks, scrolls, cursorReports, remainder } =
-				extractTerminalEvents(data, mouseRemainderRef.current);
-			mouseRemainderRef.current = remainder;
-			const lastCursorReport = cursorReports.at(-1);
-			if (lastCursorReport) {
-				cursorRowRef.current = lastCursorReport.row;
+			try {
+				const chunk = originalRead(...(args as Parameters<typeof originalRead>));
+				if (chunk === null) return null;
+				const data = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+				const sanitized = sanitizeTerminalInputChunk(
+					data,
+					terminalInputRemainderRef.current,
+					pendingClipImageRef.current,
+				);
+				terminalInputRemainderRef.current = sanitized.remainder;
+				if (sanitized.interceptedCtrlV) {
+					handleClipboardPasteRef.current();
+				}
+				if (sanitized.clean.length === 0) return null;
+				if (typeof chunk === "string") return sanitized.clean;
+				return Buffer.from(sanitized.clean, "utf8");
+			} catch (error) {
+				const logPath = crashLogger?.captureSync(error, {
+					scope: "stdin.read.patch",
+				});
+				if (logPath) {
+					console.error(`Bee crash log: ${logPath}`);
+				}
+				throw error;
 			}
-			for (const click of clicks) {
-				handleMouseClickRef.current(click);
-			}
-			for (const scroll of scrolls) {
-				handleMouseScrollRef.current(scroll);
-			}
-			// Intercept Ctrl+V (\x16) when a clipboard image is pending
-			if (pendingClipImageRef.current && clean.includes("\x16")) {
-				const filteredClean = clean.replaceAll("\x16", "");
-				handleClipboardPasteRef.current();
-				if (filteredClean.length === 0) return null;
-				if (typeof chunk === "string") return filteredClean;
-				return Buffer.from(filteredClean, "utf8");
-			}
-
-			if (clean.length === 0) return null;
-			if (typeof chunk === "string") return clean;
-			return Buffer.from(clean, "utf8");
 		}) as typeof stdin.read;
 		(stdin as unknown as { read: typeof stdin.read }).read = patchedRead;
 
 		return () => {
 			(stdin as unknown as { read: typeof stdin.read }).read = originalRead;
-			writeTerminal(disableMouse);
-			mouseRemainderRef.current = "";
+			terminalInputRemainderRef.current = "";
+			writeTerminal(
+				`${LEGACY_MOUSE_MODE_RESET}${ALTERNATE_SCROLL_MODE_DISABLE}`,
+			);
 		};
-	}, [isRawModeSupported, mouseCaptureEnabled, stdin, writeTerminal]);
+	}, [crashLogger, isRawModeSupported, mouseCaptureEnabled, stdin, writeTerminal]);
 
 	// ── Clipboard image polling ────────────────────────────────────────────────
 
@@ -1318,7 +1421,7 @@ export function App({
 			const trimmed = value.trim();
 			replaceInput("");
 			setHistoryIdx(-1);
-			setScrollbackOffset(0);
+			setScrollback({ offset: 0, snapshotLines: [] });
 
 			if (!trimmed) {
 				focusInput();
@@ -1333,236 +1436,287 @@ export function App({
 				),
 			);
 
-			if (trimmed.startsWith("!")) {
-				// ── Shell escape ──────────────────────────────────────────────────
-				const shellCmd = value.replace(/^\s*!/, "");
-				addLine(`  ! ${shellCmd}`, "shell");
-				setIsProcessing(true);
+			if (isProcessing) {
+				if (trimmed.startsWith("/")) {
+					const resolved = resolveCommand(trimmed);
+					const [cmd] = resolved.split(/\s+/);
+					if (cmd === "exit") {
+						doExit();
+						return;
+					}
+					addLine(
+						"  Commands are unavailable while an answer is running.",
+						"system",
+					);
+					focusInput();
+					return;
+				}
+				if (trimmed.startsWith("!")) {
+					addLine(
+						"  Shell commands are unavailable while an answer is running.",
+						"system",
+					);
+					focusInput();
+					return;
+				}
+				setQueuedInputs((prev) => enqueueQueuedInput(prev, trimmed));
+				crashLogger?.addBreadcrumb("queue.enqueue", {
+					text: trimmed.slice(0, 160),
+					queueDepth: queuedInputs.length + 1,
+				});
+				focusInput();
+				return;
+			}
 
-				try {
-					const proc = Bun.spawn(["sh", "-c", shellCmd], {
-						stdout: "pipe",
-						stderr: "pipe",
-						cwd: process.cwd(),
-						env: process.env,
+			try {
+				if (trimmed.startsWith("!")) {
+					// ── Shell escape ──────────────────────────────────────────────────
+					const shellCmd = value.replace(/^\s*!/, "");
+					addLine(`  ! ${shellCmd}`, "shell");
+					setIsProcessing(true);
+
+					try {
+						const proc = Bun.spawn(["sh", "-c", shellCmd], {
+							stdout: "pipe",
+							stderr: "pipe",
+							cwd: process.cwd(),
+							env: process.env,
+						});
+
+						const out = await new Response(proc.stdout).text();
+						const err = await new Response(proc.stderr).text();
+						await proc.exited;
+
+						if (out.trim()) {
+							addLines(out.trimEnd().split("\n"), "system");
+						}
+						if (err.trim()) {
+							addLines(err.trimEnd().split("\n"), "error");
+						}
+						if (proc.exitCode !== 0) {
+							addLine(`  exit ${proc.exitCode}`, "system");
+						}
+					} catch (err) {
+						addLine(`  Shell error: ${err}`, "error");
+					} finally {
+						setIsProcessing(false);
+						focusInput();
+					}
+				} else if (trimmed.startsWith("/")) {
+					// ── Slash commands ────────────────────────────────────────────────
+					const resolved = resolveCommand(trimmed);
+					const [cmd, ...args] = resolved.split(/\s+/);
+					crashLogger?.addBreadcrumb("slash.submit", {
+						command: cmd ?? "",
+						args,
 					});
 
-					const out = await new Response(proc.stdout).text();
-					const err = await new Response(proc.stderr).text();
-					await proc.exited;
+					if (cmd === "exit") {
+						doExit();
+						return;
+					}
 
-					if (out.trim()) {
-						addLines(out.trimEnd().split("\n"), "system");
+						if (cmd === "clear") {
+							setLines([]);
+							setActiveThinkingLabel(null);
+							setScrollback({ offset: 0, snapshotLines: [] });
+							focusInput();
+							return;
 					}
-					if (err.trim()) {
-						addLines(err.trimEnd().split("\n"), "error");
+
+					if (cmd === "provider" && args.length === 0) {
+						await openProviderPicker();
+						return;
 					}
-					if (proc.exitCode !== 0) {
-						addLine(`  exit ${proc.exitCode}`, "system");
+
+					setIsProcessing(true);
+					setActiveThinkingLabel(null);
+					await new Promise((resolve) => setTimeout(resolve, 0));
+					let commandResult: CommandResult = {};
+					await streamCapturedOutput(async () => {
+						commandResult = await onCommand(cmd ?? "", args);
+					});
+
+					setActiveProvider(config.provider);
+
+					const commandLines = commandResult.lines ?? [];
+					if (commandLines.length > 0) {
+						setLines((prev) =>
+							appendCappedLines(
+								prev,
+								commandLines.map((line) => ({
+									id: nextLineId(line.type),
+									text: line.text,
+									type: line.type,
+									...(line.meta ? { meta: line.meta } : {}),
+									...(line.isFirstAssistantInTurn
+										? { isFirstAssistantInTurn: true }
+										: {}),
+								})),
+								MAX_CONTENT_LINES,
+							),
+						);
 					}
-				} catch (err) {
-					addLine(`  Shell error: ${err}`, "error");
-				} finally {
+
+					if (commandResult.shouldExit) {
+						doExit();
+						return;
+					}
+
+					setHasAssistantStream(false);
+					setIsProcessing(false);
+					focusInput();
+				} else {
+					// ── Chat message ──────────────────────────────────────────────────
+					crashLogger?.addBreadcrumb("chat.submit", {
+						text: trimmed.slice(0, 160),
+					});
+					// Resolve image placeholders → actual file paths before sending
+					let message = trimmed;
+					for (const [placeholder, filePath] of imageMapRef.current) {
+						if (message.includes(placeholder)) {
+							message = message.replaceAll(placeholder, filePath);
+							imageMapRef.current.delete(placeholder);
+						}
+					}
+					addLine(`  › ${trimmed}`, "user");
+					const transcriptBatch: Array<{
+						type: "user" | "assistant" | "tool" | "thinking" | "error";
+						text: string;
+						meta?: ContentLine["meta"];
+					}> = [{ type: "user", text: `  › ${trimmed}` }];
+					setIsProcessing(true);
+					setActiveThinkingLabel(null);
+					setHasAssistantStream(false);
+					let assistantLineId: string | null = null;
+					let assistantSegmentBuffer = "";
+					let lastThinking = "";
+					let isFirstAssistantLine = true;
+					const finalizeAssistantSegment = () => {
+						if (!assistantLineId) {
+							assistantSegmentBuffer = "";
+							return;
+						}
+						if (assistantSegmentBuffer.trim()) {
+							transcriptBatch.push({
+								type: "assistant",
+								text: assistantSegmentBuffer,
+							});
+						}
+						assistantLineId = null;
+						assistantSegmentBuffer = "";
+					};
+
+					const hooks: ChatRenderHooks = {
+						onThinkingStart: (label) => {
+							finalizeAssistantSegment();
+							setActiveThinkingLabel(label);
+						},
+						onThinking: (text) => {
+							const note = text.trim();
+							if (!note || note === lastThinking) return;
+							finalizeAssistantSegment();
+							lastThinking = note;
+							setActiveThinkingLabel(null);
+							const line = `  💭 ${note}`;
+							const firstInTurn = isFirstAssistantLine;
+							if (firstInTurn) isFirstAssistantLine = false;
+							addLine(line, "thinking", undefined, firstInTurn);
+							transcriptBatch.push({ type: "thinking", text: line });
+						},
+						onTool: (name, preview) => {
+							finalizeAssistantSegment();
+							setActiveThinkingLabel(null);
+							const item = preview ? `${name} ${preview}` : name;
+							const line = `  📖 ${item}`;
+							addLine(line, "tool");
+							transcriptBatch.push({ type: "tool", text: line });
+						},
+						onToolDiff: (meta) => {
+							finalizeAssistantSegment();
+							setActiveThinkingLabel(null);
+							const line = `  ${summarizeToolDiff(meta)}`;
+							addLine(line, "tool", meta);
+							transcriptBatch.push({ type: "tool", text: line, meta });
+						},
+						onToolSummary: (summary) => {
+							finalizeAssistantSegment();
+							setActiveThinkingLabel(null);
+							const line = `  ${summary}`;
+							addLine(line, "tool");
+							transcriptBatch.push({ type: "tool", text: line });
+						},
+						onText: (text) => {
+							setActiveThinkingLabel(null);
+							setHasAssistantStream(true);
+							assistantSegmentBuffer += text;
+							if (!assistantLineId) {
+								const nextAssistantLineId = nextLineId("assistant-stream");
+								assistantLineId = nextAssistantLineId;
+								const firstInTurn = isFirstAssistantLine;
+								isFirstAssistantLine = false;
+								setLines((prev) =>
+									appendCappedLines(
+										prev,
+										[
+											{
+												id: nextAssistantLineId,
+												text: assistantSegmentBuffer,
+												type: "assistant",
+												...(firstInTurn
+													? { isFirstAssistantInTurn: true }
+													: {}),
+											},
+										],
+										MAX_CONTENT_LINES,
+									),
+								);
+							} else {
+								updateLineById(assistantLineId, assistantSegmentBuffer);
+							}
+						},
+						onError: (text) => {
+							finalizeAssistantSegment();
+							setActiveThinkingLabel(null);
+							const line = `  ${text}`;
+							addLine(line, "error");
+							transcriptBatch.push({ type: "error", text: line });
+						},
+						onPlanIntent: (goal) => {
+							planGoal = goal;
+						},
+					};
+
+					let planGoal: string | null = null;
+					await chatSession.send(message, hooks);
+
+					const askGoal = planGoal;
+					if (askGoal) {
+						// LLM detected a planning task — route to ask flow
+						try {
+							await streamCapturedOutput(async () => {
+							await onCommand("__plan_intent__", [askGoal]);
+							});
+						} catch (err) {
+							addLine(`  Plan failed: ${String(err)}`, "error");
+						}
+						setActiveProvider(config.provider);
+						setHasAssistantStream(false);
+					} else {
+						finalizeAssistantSegment();
+						await chatSession.appendTranscript(transcriptBatch);
+						setActiveThinkingLabel(null);
+						setHasAssistantStream(false);
+					}
 					setIsProcessing(false);
 					focusInput();
 				}
-			} else if (trimmed.startsWith("/")) {
-				// ── Slash commands ────────────────────────────────────────────────
-				const resolved = resolveCommand(trimmed);
-				const [cmd, ...args] = resolved.split(/\s+/);
-
-				if (cmd === "exit") {
-					doExit();
-					return;
-				}
-
-				if (cmd === "clear") {
-					setLines([]);
-					setActiveThinkingLabel(null);
-					setScrollbackOffset(0);
-					focusInput();
-					return;
-				}
-
-				if (cmd === "provider" && args.length === 0) {
-					await openProviderPicker();
-					return;
-				}
-
-				setIsProcessing(true);
-				setActiveThinkingLabel(null);
-				await new Promise((resolve) => setTimeout(resolve, 0));
-				let commandResult: CommandResult = {};
-				await streamCapturedOutput(async () => {
-					commandResult = await onCommand(cmd ?? "", args);
+			} catch (error) {
+				await reportRuntimeError("app.handleSubmit", error, {
+					input: trimmed,
 				});
-
-				setActiveProvider(config.provider);
-
-				const commandLines = commandResult.lines ?? [];
-				if (commandLines.length > 0) {
-					setLines((prev) =>
-						appendCappedLines(
-							prev,
-							commandLines.map((line) => ({
-								id: nextLineId(line.type),
-								text: line.text,
-								type: line.type,
-								...(line.meta ? { meta: line.meta } : {}),
-								...(line.isFirstAssistantInTurn
-									? { isFirstAssistantInTurn: true }
-									: {}),
-							})),
-							MAX_CONTENT_LINES,
-						),
-					);
-				}
-
-				if (commandResult.shouldExit) {
-					doExit();
-					return;
-				}
-
-				setHasAssistantStream(false);
-				setIsProcessing(false);
-				focusInput();
-			} else {
-				// ── Chat message ──────────────────────────────────────────────────
-				// Resolve image placeholders → actual file paths before sending
-				let message = trimmed;
-				for (const [placeholder, filePath] of imageMapRef.current) {
-					if (message.includes(placeholder)) {
-						message = message.replaceAll(placeholder, filePath);
-						imageMapRef.current.delete(placeholder);
-					}
-				}
-				addLine(`  › ${trimmed}`, "user");
-				const transcriptBatch: Array<{
-					type: "user" | "assistant" | "tool" | "thinking" | "error";
-					text: string;
-					meta?: ContentLine["meta"];
-				}> = [{ type: "user", text: `  › ${trimmed}` }];
-				setIsProcessing(true);
 				setActiveThinkingLabel(null);
 				setHasAssistantStream(false);
-				let assistantLineId: string | null = null;
-				let assistantSegmentBuffer = "";
-				let lastThinking = "";
-				let isFirstAssistantLine = true;
-				const finalizeAssistantSegment = () => {
-					if (!assistantLineId) {
-						assistantSegmentBuffer = "";
-						return;
-					}
-					if (assistantSegmentBuffer.trim()) {
-						transcriptBatch.push({
-							type: "assistant",
-							text: assistantSegmentBuffer,
-						});
-					}
-					assistantLineId = null;
-					assistantSegmentBuffer = "";
-				};
-
-				const hooks: ChatRenderHooks = {
-					onThinkingStart: (label) => {
-						finalizeAssistantSegment();
-						setActiveThinkingLabel(label);
-					},
-					onThinking: (text) => {
-						const note = text.trim();
-						if (!note || note === lastThinking) return;
-						finalizeAssistantSegment();
-						lastThinking = note;
-						setActiveThinkingLabel(null);
-						const line = `  💭 ${note}`;
-						const firstInTurn = isFirstAssistantLine;
-						if (firstInTurn) isFirstAssistantLine = false;
-						addLine(line, "thinking", undefined, firstInTurn);
-						transcriptBatch.push({ type: "thinking", text: line });
-					},
-					onTool: (name, preview) => {
-						finalizeAssistantSegment();
-						setActiveThinkingLabel(null);
-						const item = preview ? `${name} ${preview}` : name;
-						const line = `  📖 ${item}`;
-						addLine(line, "tool");
-						transcriptBatch.push({ type: "tool", text: line });
-					},
-					onToolDiff: (meta) => {
-						finalizeAssistantSegment();
-						setActiveThinkingLabel(null);
-						const line = `  ${summarizeToolDiff(meta)}`;
-						addLine(line, "tool", meta);
-						transcriptBatch.push({ type: "tool", text: line, meta });
-					},
-					onToolSummary: (summary) => {
-						finalizeAssistantSegment();
-						setActiveThinkingLabel(null);
-						const line = `  ${summary}`;
-						addLine(line, "tool");
-						transcriptBatch.push({ type: "tool", text: line });
-					},
-					onText: (text) => {
-						setActiveThinkingLabel(null);
-						setHasAssistantStream(true);
-						assistantSegmentBuffer += text;
-						if (!assistantLineId) {
-							const nextAssistantLineId = nextLineId("assistant-stream");
-							assistantLineId = nextAssistantLineId;
-							const firstInTurn = isFirstAssistantLine;
-							isFirstAssistantLine = false;
-							setLines((prev) =>
-								appendCappedLines(
-									prev,
-									[
-										{
-											id: nextAssistantLineId,
-											text: assistantSegmentBuffer,
-											type: "assistant",
-											...(firstInTurn ? { isFirstAssistantInTurn: true } : {}),
-										},
-									],
-									MAX_CONTENT_LINES,
-								),
-							);
-						} else {
-							updateLineById(assistantLineId, assistantSegmentBuffer);
-						}
-					},
-					onError: (text) => {
-						finalizeAssistantSegment();
-						setActiveThinkingLabel(null);
-						const line = `  ${text}`;
-						addLine(line, "error");
-						transcriptBatch.push({ type: "error", text: line });
-					},
-					onPlanIntent: (goal) => {
-						planGoal = goal;
-					},
-				};
-
-				let planGoal: string | null = null;
-				await chatSession.send(message, hooks);
-
-				const askGoal = planGoal;
-				if (askGoal) {
-					// LLM detected a planning task — route to ask flow
-					try {
-						await streamCapturedOutput(async () => {
-							await onCommand("ask", [askGoal]);
-						});
-					} catch (err) {
-						addLine(`  Plan failed: ${String(err)}`, "error");
-					}
-					setActiveProvider(config.provider);
-					setHasAssistantStream(false);
-				} else {
-					finalizeAssistantSegment();
-					await chatSession.appendTranscript(transcriptBatch);
-					setActiveThinkingLabel(null);
-					setHasAssistantStream(false);
-				}
 				setIsProcessing(false);
 				focusInput();
 			}
@@ -1571,17 +1725,49 @@ export function App({
 			addLine,
 			addLines,
 			chatSession,
+			crashLogger,
 			config.provider,
 			doExit,
+			focusInput,
+			isProcessing,
 			onCommand,
 			openProviderPicker,
 			nextLineId,
-			focusInput,
+			queuedInputs.length,
 			replaceInput,
+			reportRuntimeError,
 			streamCapturedOutput,
 			updateLineById,
 		],
 	);
+
+	useEffect(() => {
+		if (
+			isExiting ||
+			isProcessing ||
+			providerPicker !== null ||
+			queuedInputs.length === 0 ||
+			queueDrainInFlightRef.current
+		) {
+			return;
+		}
+
+		const { next, rest } = dequeueQueuedInput(queuedInputs);
+		if (!next) return;
+
+		queueDrainInFlightRef.current = true;
+		setQueuedInputs(rest);
+		crashLogger?.addBreadcrumb("queue.dequeue", {
+			id: next.id,
+			remaining: rest.length,
+		});
+
+		queueMicrotask(() => {
+			void handleSubmit(next.text).finally(() => {
+				queueDrainInFlightRef.current = false;
+			});
+		});
+	}, [crashLogger, handleSubmit, isExiting, isProcessing, providerPicker, queuedInputs]);
 
 	const applySlashQuickOption = useCallback(
 		(index: number) => {
@@ -1669,10 +1855,10 @@ export function App({
 
 	useInput((_ch, key) => {
 		if (scrollbackOffset > 0) {
-			if (key.escape) {
-				setScrollbackOffset(0);
-				focusInput();
-				return;
+				if (key.escape) {
+					setScrollback({ offset: 0, snapshotLines: [] });
+					focusInput();
+					return;
 			}
 
 			if (key.pageUp) {
@@ -1694,6 +1880,15 @@ export function App({
 				adjustScrollback("down");
 			}
 			return;
+		}
+
+		// Wheel scroll (via alternate-scroll mode) enters scrollback when
+		// processing is active (input locked) or the input box is empty.
+		if (!isExiting && (isProcessing || !input.trim())) {
+			if (key.upArrow) {
+				adjustScrollback("up");
+				return;
+			}
 		}
 
 		if (
@@ -1745,7 +1940,7 @@ export function App({
 
 	// ── Render ─────────────────────────────────────────────────────────────────
 
-	const renderContentLine = useCallback((line: ContentLine) => {
+		const renderContentLine = useCallback((line: ContentLine) => {
 		const label = line.isFirstAssistantInTurn ? "›" : getContentLineLabel(line);
 		const bodyText =
 			line.type === "assistant"
@@ -1838,58 +2033,30 @@ export function App({
 					</Box>
 				) : null}
 			</Box>
-		);
-	}, [stdout.columns]);
+			);
+		}, [stdout.columns]);
 
-	const scrollbackSnapshotLines = useMemo(() => {
-		if (scrollbackOffset === 0) return [];
-
-		const terminalWidth = Math.max(20, stdout.columns ?? 80);
-		const snapshot = renderToString(
-			<Box flexDirection="column" width={terminalWidth}>
-				{renderItems.map((item) =>
-					item.kind === "meta-group" ? (
-						<ThinkingCollapsibleLine
-							key={`scrollback-${item.id}`}
-							groupId={`scrollback-${item.id}`}
-							groupType={item.groupType}
-							lines={item.lines}
-							expanded={expandedThinkingIds.has(item.id)}
-							isActive={false}
-							isStreaming={isProcessing && streamingMetaGroupId === item.id}
-							onToggle={() => {}}
-							onFocusChange={() => {}}
-						/>
-					) : (
-						renderContentLine(item.line)
-					),
-				)}
-				{displayPlan && !isExiting ? (
-					<Box flexDirection="column" marginTop={1}>
-						<PlanTaskTree
-							plans={[displayPlan]}
-							taskLogs={planTaskLogs}
-							terminalWidth={terminalWidth}
-						/>
-					</Box>
-				) : null}
-			</Box>,
-			{ columns: terminalWidth },
-		);
-
-		return extractScrollbackSnapshotLines(snapshot);
+	const captureScrollbackSnapshotLines = useCallback(() => {
+		return buildScrollbackSnapshotLines(renderItems, {
+			displayPlan: displayPlan && !isExiting ? displayPlan : null,
+			planTaskLogs,
+			expandedThinkingIds,
+			isProcessing,
+			streamingMetaGroupId,
+		});
 	}, [
 		displayPlan,
 		expandedThinkingIds,
 		isExiting,
 		isProcessing,
 		planTaskLogs,
-		renderContentLine,
 		renderItems,
-		scrollbackOffset,
-		stdout.columns,
 		streamingMetaGroupId,
 	]);
+
+	useEffect(() => {
+		captureScrollbackSnapshotLinesRef.current = captureScrollbackSnapshotLines;
+	}, [captureScrollbackSnapshotLines]);
 	const scrollbackVisibleRows = Math.max(1, scrollbackViewportRows - 1);
 	const scrollbackMaxOffset = Math.max(
 		0,
@@ -1911,8 +2078,21 @@ export function App({
 
 	useEffect(() => {
 		if (scrollbackOffset === 0) return;
-		setScrollbackOffset((prev) => Math.min(prev, scrollbackMaxOffset));
+		setScrollback((prev) => {
+			return clampScrollbackState(prev, scrollbackMaxOffset);
+		});
 	}, [scrollbackMaxOffset, scrollbackOffset]);
+
+	useEffect(() => {
+		if (!shouldCaptureScrollbackSnapshot(scrollback)) return;
+		setScrollback((prev) => {
+			if (!shouldCaptureScrollbackSnapshot(prev)) return prev;
+			return {
+				...prev,
+				snapshotLines: captureScrollbackSnapshotLines(),
+			};
+		});
+	}, [captureScrollbackSnapshotLines, scrollback]);
 
 	return (
 		<Box flexDirection="column">
@@ -1927,7 +2107,7 @@ export function App({
 					overflowY="hidden"
 				>
 					<Text color="gray" dimColor>
-						{`Scrollback · ${scrollbackOffset} lines up · wheel ↓ or Esc to return`}
+						{`Scrollback · ${scrollbackOffset} lines up · scroll ↓ or Esc to return`}
 					</Text>
 					{visibleScrollbackLines.map((line, index) => (
 						<Text key={`scrollback-line-${scrollbackStart + index}`}>
@@ -2007,13 +2187,12 @@ export function App({
 					statusDivider={statusDivider}
 					statusInfo={statusInfo}
 					suggestions={slashSuggestionHints}
+					planSummary={inputPlanSummary}
 					isActive
 					inputDisabled={Boolean(providerPicker)}
 					isProcessing={isProcessing}
 					canSubmit={
-						!isProcessing &&
-						providerPicker === null &&
-						!slashQuickOptionsVisible
+						providerPicker === null && !slashQuickOptionsVisible
 					}
 					imageHint={imageHint && !isProcessing}
 					onChange={handleInputChange}
@@ -2028,6 +2207,7 @@ export function App({
 					providerSelectedIndex={providerPickerIndex}
 				/>
 			)}
+			{!isExiting ? <QueuePanel items={queuedInputs} /> : null}
 		</Box>
 	);
 }

@@ -11,10 +11,13 @@ import { describe, expect, it } from "bun:test";
 import { PlanStatus } from "../types/plan.ts";
 import {
 	appendCappedLines,
+	buildScrollbackSnapshotLines,
+	buildInputPlanSummary,
 	capContentLines,
 	computeScrollbackWindow,
 	extractCapturedOutputChunk,
 	extractScrollbackSnapshotLines,
+	formatPlanSummaryHash,
 	getInputPanelRows,
 	shouldRenderPlanFocusView,
 } from "../cli/ui/App.tsx";
@@ -353,6 +356,81 @@ describe("App memory guards", () => {
 });
 
 describe("App scrollback helpers", () => {
+	it("captures a snapshot once when entering scrollback", async () => {
+		const { advanceScrollbackState } = await import("../cli/ui/App.tsx");
+		const next = advanceScrollbackState(
+			{ offset: 0, snapshotLines: [] },
+			"up",
+			4,
+			["alpha", "beta"],
+		);
+
+		expect(next).toEqual({
+			offset: 4,
+			snapshotLines: ["alpha", "beta"],
+		});
+	});
+
+	it("keeps the existing snapshot while scrolling further up", async () => {
+		const { advanceScrollbackState } = await import("../cli/ui/App.tsx");
+		const next = advanceScrollbackState(
+			{ offset: 4, snapshotLines: ["alpha", "beta"] },
+			"up",
+			4,
+			["new"],
+		);
+
+		expect(next).toEqual({
+			offset: 8,
+			snapshotLines: ["alpha", "beta"],
+		});
+	});
+
+	it("clears the snapshot when scrollback returns to the live view", async () => {
+		const { advanceScrollbackState } = await import("../cli/ui/App.tsx");
+		const next = advanceScrollbackState(
+			{ offset: 4, snapshotLines: ["alpha", "beta"] },
+			"down",
+			4,
+		);
+
+		expect(next).toEqual({
+			offset: 0,
+			snapshotLines: [],
+		});
+	});
+
+	it("requests a snapshot only while scrollback is active and empty", async () => {
+		const { shouldCaptureScrollbackSnapshot } = await import("../cli/ui/App.tsx");
+
+		expect(
+			shouldCaptureScrollbackSnapshot({ offset: 4, snapshotLines: [] }),
+		).toBe(true);
+		expect(
+			shouldCaptureScrollbackSnapshot({ offset: 4, snapshotLines: ["alpha"] }),
+		).toBe(false);
+		expect(
+			shouldCaptureScrollbackSnapshot({ offset: 0, snapshotLines: [] }),
+		).toBe(false);
+	});
+
+	it("does not clamp scrollback back to live view before the snapshot exists", async () => {
+		const { clampScrollbackState } = await import("../cli/ui/App.tsx");
+
+		expect(
+			clampScrollbackState({ offset: 4, snapshotLines: [] }, 0),
+		).toEqual({
+			offset: 4,
+			snapshotLines: [],
+		});
+		expect(
+			clampScrollbackState({ offset: 4, snapshotLines: ["alpha"] }, 0),
+		).toEqual({
+			offset: 0,
+			snapshotLines: [],
+		});
+	});
+
 	it("computes the tail-aligned visible window", () => {
 		expect(computeScrollbackWindow(10, 4, 0)).toEqual([6, 10]);
 		expect(computeScrollbackWindow(10, 4, 2)).toEqual([4, 8]);
@@ -368,10 +446,115 @@ describe("App scrollback helpers", () => {
 		).toEqual(["alpha", "beta!"]);
 	});
 
+	it("builds scrollback snapshot lines directly from render items", () => {
+		const plan = {
+			id: "plan-1",
+			title: "Execution Plan",
+			description: "Execution Plan",
+			status: PlanStatus.running,
+			createdAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
+			tasks: [
+				{
+					id: "task-1",
+					title: "Investigate crash",
+					description: "Inspect the latest crash log",
+					status: PlanStatus.running,
+					createdAt: new Date().toISOString(),
+					updatedAt: new Date().toISOString(),
+				},
+			],
+		};
+
+		const lines = buildScrollbackSnapshotLines(
+			[
+				{
+					kind: "line",
+					line: { id: "u1", type: "user", text: "  › hello" },
+				},
+				{
+					kind: "meta-group",
+					id: "meta-1",
+					groupType: "thinking",
+					lines: [{ id: "t1", type: "thinking", text: "  💭 tracing root cause" }],
+				},
+			],
+			{
+				displayPlan: plan,
+				planTaskLogs: { "task-1": ["latest breadcrumb captured"] },
+				expandedThinkingIds: new Set<string>(),
+				isProcessing: false,
+				streamingMetaGroupId: null,
+			},
+		);
+
+		expect(lines).toContain("› hello");
+		expect(lines).toContain("▶ [tracing root cause]");
+		expect(lines).toContain("◇ Execution Plan [ ▶ RUNNING ]");
+		expect(lines).toContain("└─ ▸ [ PLAN ] Investigate crash [ ▶ RUNNING ]");
+	});
+
 	it("matches input panel height for picker and slash-option states", () => {
 		expect(getInputPanelRows(0, 0)).toBe(6);
+		expect(getInputPanelRows(0, 0, true)).toBe(7);
 		expect(getInputPanelRows(3, 0)).toBe(11);
 		expect(getInputPanelRows(0, 2)).toBe(10);
+	});
+});
+
+describe("App plan summary helpers", () => {
+	it("extracts the first 8 chars from the plan hash suffix", () => {
+		expect(
+			formatPlanSummaryHash("skeleton_2cb8fb4f66a8454198c67d361c7a4bc1"),
+		).toBe("2cb8fb4f");
+	});
+
+	it("falls back to the raw id when there is no hash suffix", () => {
+		expect(formatPlanSummaryHash("plan-1")).toBe("plan-1");
+	});
+
+	it("summarizes the active running task as compact input-panel metadata", () => {
+		const plan = {
+			id: "skeleton_2cb8fb4f66a8454198c67d361c7a4bc1",
+			title: "Ship ACP wiring",
+			description: "Ship ACP wiring",
+			status: PlanStatus.running,
+			createdAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
+			tasks: [
+				{
+					id: "task-1",
+					title: "Prepare fixtures",
+					description: "Prepare fixtures",
+					status: PlanStatus.completed,
+					createdAt: new Date().toISOString(),
+					updatedAt: new Date().toISOString(),
+				},
+				{
+					id: "task-2",
+					title: "Wire compact plan status into the input panel",
+					description: "Wire compact plan status into the input panel",
+					status: PlanStatus.running,
+					createdAt: new Date().toISOString(),
+					updatedAt: new Date().toISOString(),
+				},
+				{
+					id: "task-3",
+					title: "Polish truncation",
+					description: "Polish truncation",
+					status: PlanStatus.pending,
+					createdAt: new Date().toISOString(),
+					updatedAt: new Date().toISOString(),
+				},
+			],
+		};
+
+		expect(buildInputPlanSummary(plan)).toEqual({
+			planHash: "2cb8fb4f",
+			progressLabel: "task 2/3",
+			taskTitle: "Wire compact plan status into the input panel",
+			taskStatus: PlanStatus.running,
+		});
 	});
 });
 

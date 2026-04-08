@@ -1,6 +1,10 @@
 import type { TerminalExtractResult } from "./types.ts";
 import type { WriteStream } from "node:tty";
 
+export const LEGACY_MOUSE_MODE_RESET = "\u001b[?1000l\u001b[?1006l";
+export const ALTERNATE_SCROLL_MODE_ENABLE = "\u001b[?1007h";
+export const ALTERNATE_SCROLL_MODE_DISABLE = "\u001b[?1007l";
+
 export function writeTerminalControl(sequence: string): void {
   const target = process.stderr.isTTY ? process.stderr : process.stdout;
   target.write(sequence);
@@ -16,6 +20,45 @@ export function enterAlternateScreen(target: WriteStream = process.stdout): void
 
 export function exitAlternateScreen(target: WriteStream = process.stdout): void {
   target.write("\u001b[?1049l");
+}
+
+export function restoreTerminalAfterCrash(): void {
+  const target = (process.stderr.isTTY ? process.stderr : process.stdout) as WriteStream;
+  try {
+    if (
+      process.stdin.isTTY &&
+      typeof (process.stdin as NodeJS.ReadStream).setRawMode === "function"
+    ) {
+      (process.stdin as NodeJS.ReadStream).setRawMode(false);
+    }
+  } catch {
+    // best-effort
+  }
+  try {
+    target.write(`${LEGACY_MOUSE_MODE_RESET}${ALTERNATE_SCROLL_MODE_DISABLE}\u001b[?25h\u001b[0m`);
+    exitAlternateScreen(target);
+    target.write("\n");
+  } catch {
+    // best-effort
+  }
+}
+
+export function sanitizeTerminalInputChunk(
+  data: string,
+  remainder = "",
+  interceptCtrlV = false,
+): {
+  clean: string;
+  remainder: string;
+  interceptedCtrlV: boolean;
+} {
+  const extracted = extractTerminalEvents(data, remainder);
+  const clean = interceptCtrlV ? extracted.clean.replaceAll("\x16", "") : extracted.clean;
+  return {
+    clean,
+    remainder: extracted.remainder,
+    interceptedCtrlV: interceptCtrlV && extracted.clean.includes("\x16"),
+  };
 }
 
 export function extractTerminalEvents(data: string, remainder = ""): TerminalExtractResult {

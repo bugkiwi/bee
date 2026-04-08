@@ -33,6 +33,11 @@ import { App } from "./ui/App.tsx";
 import { clearTerminalScreen, enterAlternateScreen, exitAlternateScreen } from "./ui/terminal.ts";
 import { loadAskPlanPreviewLine } from "../utils/ask-plan-preview.ts";
 import type { CommandResult } from "./ui/types.ts";
+import {
+  consumeLatestCrashNotice,
+  formatLatestCrashNoticeLines,
+  type CrashLogger,
+} from "../observability/crash-logger.ts";
 
 // ─── Session summary ──────────────────────────────────────────────────────────
 
@@ -378,7 +383,7 @@ async function handleCommand(
       return { lines: [previewLine] };
     }
 
-    case "ask": {
+    case "__plan_intent__": {
       // Triggered by planning intent detection — always auto-confirms
       const goal = args.join(" ").trim();
       if (!goal) break;
@@ -590,9 +595,22 @@ async function handleCommand(
 export async function runRepl(
   config: WorkspaceConfig,
   dirs: { tasks: string; state: string; logs: string; plans: string; config: string },
-  opts: { resumeSessionId?: string; resumeLatest?: boolean; showIntro?: boolean } = {}
+  opts: {
+    resumeSessionId?: string;
+    resumeLatest?: boolean;
+    showIntro?: boolean;
+    crashLogger?: CrashLogger;
+  } = {}
 ): Promise<void> {
   const renderStream = process.stderr.isTTY ? process.stderr : process.stdout;
+  opts.crashLogger?.updateContext({
+    scope: "repl",
+    provider: config.provider,
+  });
+  opts.crashLogger?.addBreadcrumb("repl.start", {
+    provider: config.provider,
+    cwd: process.cwd(),
+  });
   const chatSession = new ChatSession(config, {
     onStatusUpdate: () => {},  // Ink component handles status display
     projectPath: process.cwd(),
@@ -602,7 +620,11 @@ export async function runRepl(
     resumeLatest: opts.resumeLatest,
   });
 
-  const initialStatus = await getStatusLines(dirs);
+  const latestCrashNotice = await consumeLatestCrashNotice(dirs.logs);
+  const initialStatus = [
+    ...formatLatestCrashNoticeLines(latestCrashNotice, process.cwd()),
+    ...(await getStatusLines(dirs)),
+  ];
   const initialTranscript = chatSession.transcript.map((line) => ({
     type: line.type,
     text: line.text,
@@ -634,6 +656,7 @@ export async function runRepl(
       initialStatus={initialStatus}
       initialTranscript={initialTranscript}
       activePlan={activePlan}
+      crashLogger={opts.crashLogger}
       onCommand={(cmd, args) => handleCommand(cmd, args, config, dirs, chatSession, sharedAskPlanStore)}
       onProviderPickerRequest={async () => getProviderPickerOptions(config)}
       onProviderSelected={async (provider) => {
@@ -650,6 +673,7 @@ export async function runRepl(
 
   enterAlternateScreen(renderStream);
   clearTerminalScreen(renderStream);
+  let pendingCrashLogPath: string | null = null;
 
   try {
     if (opts.showIntro) {
@@ -675,12 +699,25 @@ export async function runRepl(
 
     try {
       await ink.waitUntilExit();
+    } catch (err) {
+      pendingCrashLogPath = (await opts.crashLogger?.capture(err, {
+        scope: "ink.waitUntilExit",
+        activePlanId: sharedAskPlanStore.activePlan?.id ?? null,
+        sessionId: chatSession.beeSession?.id ?? null,
+      })) ?? null;
+      if (err && typeof err === "object") {
+        (err as Record<string, unknown>).__beeCrashLogged = true;
+      }
+      throw err;
     } finally {
       renderStream.off("resize", repaint);
       if (resizeTimer) clearTimeout(resizeTimer);
     }
   } finally {
     exitAlternateScreen(renderStream);
+    if (pendingCrashLogPath) {
+      process.stderr.write(`Bee crash log: ${pendingCrashLogPath}\n`);
+    }
     const summaryLines = getSessionSummaryLines(chatSession);
     console.log(summaryLines.join("\n"));
   }
