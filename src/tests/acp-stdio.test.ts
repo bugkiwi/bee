@@ -21,7 +21,9 @@ describe("stdio ACP runtime", () => {
 	});
 
 	it("increments JSON-RPC ids monotonically", () => {
-		expect(nextJsonRpcId()).toBeGreaterThan(0);
-		expect(nextJsonRpcId()).toBeGreaterThan(1);
+		const first = nextJsonRpcId();
+		const second = nextJsonRpcId();
+
+		expect(second).toBeGreaterThan(first);
 	});
 });
