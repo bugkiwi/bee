@@ -432,6 +432,92 @@ describe("ChatSession initSession", () => {
 		expect(after.length).toBe(before.length);
 		expect(chat.beeSession).toBeNull();
 	});
+
+	it("migrates legacy claude-acp provider bindings when resuming a session", async () => {
+		const projectPath = join(baseDir, "project-chat-resume-legacy-claude-acp");
+		await mkdir(projectPath, { recursive: true });
+		const mgr = new SessionManager(projectPath, baseDir);
+		const sessionId = "legacy-claude-acp-session";
+		const sessionsDir = join(
+			baseDir,
+			"projects",
+			projectPathHash(projectPath),
+			"sessions",
+		);
+		await mkdir(sessionsDir, { recursive: true });
+		const claudeLog = join(baseDir, "claude-legacy-resume.jsonl");
+		await writeFile(
+			join(sessionsDir, `${sessionId}.json`),
+			JSON.stringify(
+				{
+					id: sessionId,
+					createdAt: "2026-01-01T00:00:00.000Z",
+					updatedAt: "2026-01-01T00:00:00.000Z",
+					projectPath,
+					activeProvider: "claude-acp",
+					providers: {
+						"claude-acp": {
+							provider: "claude-acp",
+							nativeId: "claude-legacy-session-42",
+							syncedThrough: 3,
+							tokens: 0,
+							cost: 0,
+							lastActive: "2026-01-01T00:00:00.000Z",
+						},
+					},
+					messageCount: 1,
+					transcriptSeq: 3,
+					transcript: [
+						{
+							type: "user",
+							text: "  › first",
+							at: "2026-01-01T00:00:00.000Z",
+							seq: 1,
+						},
+						{
+							type: "assistant",
+							text: "reply",
+							at: "2026-01-01T00:00:01.000Z",
+							seq: 2,
+						},
+					],
+				},
+				null,
+				2,
+			),
+			"utf8",
+		);
+
+		const config = {
+			...DEFAULT_CONFIG,
+			provider: "kimi",
+			acp_commands: {
+				claude: createFakeAcpCommand("claude", claudeLog),
+			},
+		};
+		const chat = new ChatSession(config, { projectPath });
+		(chat as unknown as { _sessionManager: SessionManager })._sessionManager =
+			mgr;
+
+		const resumed = await chat.initSession({ resumeSessionId: sessionId });
+		await chat.send("resume me", {});
+		await Bun.sleep(25);
+
+		expect(config.provider).toBe("claude");
+		expect(resumed.activeProvider).toBe("claude");
+		expect(resumed.providers.claude?.nativeId).toBe("claude-legacy-session-42");
+		expect(resumed.providers["claude-acp"]).toBeUndefined();
+
+		const claudeMessages = await readJsonLines(claudeLog);
+		expect(
+			claudeMessages.filter((message) => message.method === "session/new").length,
+		).toBe(0);
+		expect(
+			claudeMessages
+				.filter((message) => message.method === "session/load")
+				.at(-1)?.params?.sessionId,
+		).toBe("claude-legacy-session-42");
+	});
 });
 
 describe("ChatSession switchProvider", () => {

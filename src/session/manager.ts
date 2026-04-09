@@ -11,6 +11,7 @@
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { ensureDir, readJsonFile, writeJsonFile, listFiles } from "../utils/fs.ts";
+import { normalizeProviderName } from "../types/config.ts";
 import type { TranscriptLineMeta } from "../types/transcript.ts";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -98,6 +99,7 @@ export class SessionManager {
   }
 
   private normalizeSessionShape(raw: BeeSession): BeeSession {
+    const activeProvider = normalizeProviderName(raw.activeProvider);
     const rawTranscript = Array.isArray((raw as Partial<BeeSession>).transcript)
       ? (raw as Partial<BeeSession>).transcript as BeeTranscriptLine[]
       : [];
@@ -110,20 +112,40 @@ export class SessionManager {
         ? Math.max((raw as Partial<BeeSession>).transcriptSeq!, transcript.at(-1)?.seq ?? 0)
         : (transcript.at(-1)?.seq ?? 0);
     const rawProviders = raw.providers ?? {};
-    const providers = Object.fromEntries(
-      Object.entries(rawProviders).map(([name, binding]) => [
-        name,
-        {
+    const providers = Object.entries(rawProviders).reduce<Record<string, ProviderBinding>>(
+      (acc, [name, binding]) => {
+        const provider = normalizeProviderName(name);
+        const normalizedBinding: ProviderBinding = {
           ...binding,
+          provider,
           syncedThrough:
             typeof binding.syncedThrough === "number"
               ? Math.min(binding.syncedThrough, transcriptSeq)
-              : (name === raw.activeProvider ? transcriptSeq : 0),
-        },
-      ])
+              : (provider === activeProvider ? transcriptSeq : 0),
+        };
+        const existing = acc[provider];
+        if (!existing) {
+          acc[provider] = normalizedBinding;
+          return acc;
+        }
+        acc[provider] = {
+          ...existing,
+          nativeId: existing.nativeId ?? normalizedBinding.nativeId,
+          syncedThrough: Math.max(existing.syncedThrough, normalizedBinding.syncedThrough),
+          tokens: Math.max(existing.tokens, normalizedBinding.tokens),
+          cost: Math.max(existing.cost, normalizedBinding.cost),
+          lastActive:
+            existing.lastActive >= normalizedBinding.lastActive
+              ? existing.lastActive
+              : normalizedBinding.lastActive,
+        };
+        return acc;
+      },
+      {}
     );
     return {
       ...raw,
+      activeProvider,
       providers,
       transcriptSeq,
       transcript,
