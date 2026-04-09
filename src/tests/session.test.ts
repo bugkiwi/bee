@@ -1,11 +1,100 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatSession } from "../cli/chat.ts";
 import { resolveAcpAgentName } from "../providers/acp/agents.ts";
+import type { AcpCommandConfig } from "../providers/acp/commands.ts";
 import { SessionManager, projectPathHash } from "../session/manager.ts";
 import { DEFAULT_CONFIG } from "../types/config.ts";
+
+function createFakeAcpCommand(
+	provider: string,
+	logPath: string,
+): AcpCommandConfig {
+	return {
+		command: "node",
+		args: [
+			"-e",
+			String.raw`
+const fs = require("fs");
+const provider = process.env.BEE_TEST_ACP_PROVIDER;
+const logPath = process.env.BEE_TEST_ACP_LOG_PATH;
+
+function log(message) {
+	fs.appendFileSync(logPath, JSON.stringify(message) + "\n");
+}
+
+function send(message) {
+	process.stdout.write(JSON.stringify(message) + "\n");
+}
+
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+	buffer += chunk;
+	const lines = buffer.split("\n");
+	buffer = lines.pop() ?? "";
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		const message = JSON.parse(line);
+		log(message);
+		if (message.method === "initialize") {
+			send({ jsonrpc: "2.0", id: message.id, result: { ok: true } });
+			continue;
+		}
+		if (message.method === "session/new") {
+			send({
+				jsonrpc: "2.0",
+				id: message.id,
+				result: { sessionId: provider + "-session-1" },
+			});
+			continue;
+		}
+		if (message.method === "session/load") {
+			send({
+				jsonrpc: "2.0",
+				id: message.id,
+				result: { sessionId: message.params.sessionId },
+			});
+			continue;
+		}
+		if (message.method === "session/prompt") {
+			send({
+				jsonrpc: "2.0",
+				method: "session/update",
+				params: {
+					sessionId: message.params.sessionId,
+					update: {
+						sessionUpdate: "agent_message_chunk",
+						content: { type: "text", text: "reply from " + provider },
+					},
+				},
+			});
+			send({
+				jsonrpc: "2.0",
+				id: message.id,
+				result: { stopReason: "end_turn" },
+			});
+		}
+	}
+});
+`,
+		],
+		env: {
+			BEE_TEST_ACP_PROVIDER: provider,
+			BEE_TEST_ACP_LOG_PATH: logPath,
+		},
+	};
+}
+
+async function readJsonLines(path: string): Promise<any[]> {
+	const text = await readFile(path, "utf8");
+	return text
+		.split("\n")
+		.filter((line) => line.trim().length > 0)
+		.map((line) => JSON.parse(line));
+}
 
 describe("projectPathHash", () => {
 	it("converts absolute path to dash-separated hash", () => {
@@ -396,5 +485,48 @@ describe("ChatSession switchProvider", () => {
 		expect(reloaded).not.toBeNull();
 		expect(reloaded?.transcriptSeq).toBe(2);
 		expect(reloaded?.providers.claude?.syncedThrough).toBe(2);
+	});
+
+	it("persists provider-scoped ACP session ids and reloads the matching provider session", async () => {
+		const projectPath = "/Users/test/Work/project-chat-acp-provider-sessions";
+		const mgr = new SessionManager(projectPath, baseDir);
+		const claudeLog = join(baseDir, "claude-acp.jsonl");
+		const codexLog = join(baseDir, "codex-acp.jsonl");
+		const config = {
+			...DEFAULT_CONFIG,
+			provider: "claude",
+			acp_commands: {
+				claude: createFakeAcpCommand("claude", claudeLog),
+				codex: createFakeAcpCommand("codex", codexLog),
+			},
+		};
+		const chat = new ChatSession(config, { projectPath });
+		(chat as unknown as { _sessionManager: SessionManager })._sessionManager =
+			mgr;
+
+		const session = await chat.initSession();
+		await chat.send("first", {});
+		await chat.switchProvider("codex");
+		await chat.send("second", {});
+		await chat.switchProvider("claude");
+		await chat.send("third", {});
+
+		const reloaded = await mgr.load(session.id);
+		expect(reloaded?.providers.claude?.nativeId).toBe("claude-session-1");
+		expect(reloaded?.providers.codex?.nativeId).toBe("codex-session-1");
+
+		const claudeMessages = await readJsonLines(claudeLog);
+		const codexMessages = await readJsonLines(codexLog);
+		expect(
+			claudeMessages.filter((message) => message.method === "session/new").length,
+		).toBe(1);
+		expect(
+			claudeMessages
+				.filter((message) => message.method === "session/load")
+				.at(-1)?.params?.sessionId,
+		).toBe("claude-session-1");
+		expect(
+			codexMessages.filter((message) => message.method === "session/new").length,
+		).toBe(1);
 	});
 });

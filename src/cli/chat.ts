@@ -1,11 +1,12 @@
 import chalk from "chalk";
 import { resolveAcpAgentName } from "../providers/acp/agents.ts";
-import {
-	AcpClient,
-	type AcpMessage,
-	type AcpRunRequest,
-	type AcpRunStatus,
+import type {
+	AcpJsonRpcNotification,
+	AcpJsonRpcRequest,
+	AcpRunRequest,
 } from "../providers/acp/client.ts";
+import { getAcpCommandConfig } from "../providers/acp/commands.ts";
+import { StdioAcpClient } from "../providers/acp/stdio-client.ts";
 import type { BeeSession, BeeTranscriptLine } from "../session/manager.ts";
 import { SessionManager } from "../session/manager.ts";
 import type { WorkspaceConfig } from "../types/config.ts";
@@ -109,7 +110,14 @@ class ToolTracker {
 
 	/** Register a tool call and print it as its own line. */
 	track(name: string, args: Record<string, unknown>): void {
-		const preview = toolPreview(name, args);
+		this.trackPreview(name, toolPreview(name, args), args);
+	}
+
+	trackPreview(
+		name: string,
+		preview: string,
+		args: Record<string, unknown> = {},
+	): void {
 		const diffPreview = createToolDiffPreview(name, args);
 		this.calls.push({ name, preview });
 		this.options.onTool?.(name, preview);
@@ -355,29 +363,85 @@ export function buildProviderRequest(
 	return `${handoff}\n\nNew user message:\n${userMessage}`;
 }
 
-function isAcpTerminalStatus(status: AcpRunStatus["status"]): boolean {
+interface AcpTextContent {
+	type?: string;
+	text?: string;
+}
+
+interface AcpWrappedContent {
+	type?: string;
+	content?: AcpTextContent;
+}
+
+interface AcpPermissionOption {
+	kind?: string;
+	optionId?: string;
+}
+
+interface AcpSessionUpdate {
+	sessionUpdate?: string;
+	content?: AcpTextContent | AcpWrappedContent[];
+	toolCallId?: string;
+	title?: string;
+}
+
+function buildAcpSessionParams(cwd: string): {
+	cwd: string;
+	mcpServers: never[];
+} {
+	return {
+		cwd,
+		mcpServers: [],
+	};
+}
+
+function pickAcpPermissionOptionId(
+	options: AcpPermissionOption[],
+): string | null {
 	return (
-		status === "completed" ||
-		status === "failed" ||
-		status === "cancelled" ||
-		status === "awaiting"
+		options.find((option) => option.kind === "allow_always")?.optionId ??
+		options.find((option) => option.kind === "allow_once")?.optionId ??
+		options[0]?.optionId ??
+		null
 	);
 }
 
-function formatAcpError(error: AcpRunStatus["error"]): string | null {
-	if (!error) return null;
-	if (typeof error === "string") return error;
-	return error.message ?? null;
+function extractAcpUpdateText(
+	content?: AcpTextContent | AcpWrappedContent[],
+): string {
+	if (!content) return "";
+	if (!Array.isArray(content)) {
+		return content.type === "text" ? (content.text ?? "") : "";
+	}
+	return content
+		.map((item) =>
+			item.type === "content" && item.content?.type === "text"
+				? (item.content.text ?? "")
+				: "",
+		)
+		.join("");
 }
 
-function extractAcpOutputText(output: AcpMessage[] | undefined): string {
-	if (!output?.length) return "";
-	return output
-		.filter((message) => message.role !== "user")
-		.flatMap((message) => message.parts)
-		.map((part) => part.content)
-		.join("\n")
-		.trim();
+function parseAcpToolTitle(title: string): { name: string; preview: string } {
+	const [name, preview] = title.split(": ", 2);
+	return {
+		name: name || "tool",
+		preview: preview ?? title,
+	};
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+	return value && typeof value === "object"
+		? (value as Record<string, unknown>)
+		: null;
+}
+
+function extractSessionId(value: unknown): string | null {
+	const record = asRecord(value);
+	const sessionId = record?.sessionId;
+	return typeof sessionId === "string" && sessionId.length > 0
+		? sessionId
+		: null;
 }
 
 export function buildAcpChatRequest(
@@ -412,8 +476,6 @@ export class ChatSession {
 	private _claudeSessionId: string | null = null;
 	private _codexSessionId: string | null = null;
 	private _kimiSessionId: string | null = null;
-	private _acpClient: AcpClient | null = null;
-	private _acpClientBaseUrl: string | null = null;
 
 	// ── Persistent session (optional) ────────────────────────────────────────
 	private _sessionManager: SessionManager | null = null;
@@ -545,22 +607,8 @@ export class ChatSession {
 		return this._beeSession;
 	}
 
-	private shouldUseAcp(): boolean {
-		return Boolean(this.config.acp_base_url);
-	}
-
-	private getAcpClient(): AcpClient {
-		const baseUrl = this.config.acp_base_url?.trim();
-		if (!baseUrl) {
-			throw new Error(
-				"ACP is not configured. Set acp_base_url in .bee/config.json.",
-			);
-		}
-		if (!this._acpClient || this._acpClientBaseUrl !== baseUrl) {
-			this._acpClient = new AcpClient(baseUrl, this.config.timeout_ms);
-			this._acpClientBaseUrl = baseUrl;
-		}
-		return this._acpClient;
+	private shouldUseAcp(provider = this.config.provider): boolean {
+		return provider === "claude" || provider === "codex" || provider === "kimi";
 	}
 
 	private getProviderSessionId(provider: string): string | null {
@@ -638,9 +686,6 @@ export class ChatSession {
 					case "codex":
 						await this.sendCodex(userMessage, hooks);
 						break;
-					case "kimi":
-						await this.sendKimi(userMessage, hooks);
-						break;
 					default:
 						await this.sendClaude(userMessage, hooks);
 				}
@@ -676,16 +721,20 @@ export class ChatSession {
 		const eventMode = Boolean(hooks);
 		const stopSpinner = eventMode ? () => {} : startSpinner("thinking…");
 		let spinnerStopped = false;
+		let client: StdioAcpClient | null = null;
+		const tracker = new ToolTracker({
+			write: eventMode ? undefined : (text) => process.stdout.write(text),
+			onTool: (name, preview) => hooks?.onTool?.(name, preview),
+			onToolDiff: (meta) => hooks?.onToolDiff?.(meta),
+			onSummary: (summary) => hooks?.onToolSummary?.(summary),
+		});
+		let fullText = "";
+		let firstTextSeen = false;
+		let planMarkerDetected = false;
 		const requestMessage = buildProviderRequest(
 			userMessage,
 			provider,
 			this._beeSession,
-		);
-		const request = buildAcpChatRequest(
-			PLAN_INTENT_PREFIX + requestMessage,
-			provider,
-			this.config,
-			this.getProviderSessionId(provider),
 		);
 
 		const stopOnce = () => {
@@ -696,56 +745,124 @@ export class ChatSession {
 		};
 
 		try {
-			const client = this.getAcpClient();
-			const run = await client.createRun(request);
-			if (run.session_id) {
-				await this.bindProviderSessionId(provider, run.session_id);
-			}
+			client = new StdioAcpClient(
+				getAcpCommandConfig(provider, this.config),
+				{
+					onNotification: (message: AcpJsonRpcNotification) => {
+						if (message.method !== "session/update") return;
+						const params = asRecord(message.params);
+						const update = asRecord(params?.update) as AcpSessionUpdate | null;
+						if (!update?.sessionUpdate) return;
 
-			const final = isAcpTerminalStatus(run.status)
-				? run
-				: await client.waitForCompletion(run.run_id, 1000);
+						switch (update.sessionUpdate) {
+							case "agent_message_chunk": {
+								const text = extractAcpUpdateText(update.content);
+								if (!text) return;
+								stopOnce();
+								fullText += text;
+								if (!firstTextSeen) {
+									firstTextSeen = true;
+									if (fullText.trimStart().startsWith("<bee:plan")) {
+										planMarkerDetected = true;
+									}
+								}
+								if (planMarkerDetected) return;
+								tracker.beforeText();
+								if (eventMode) hooks?.onText?.(text);
+								else process.stdout.write(text);
+								return;
+							}
+							case "agent_thought_chunk": {
+								const excerpt = extractAcpUpdateText(update.content).trim();
+								if (!excerpt) return;
+								stopOnce();
+								if (eventMode) {
+									hooks?.onThinking?.(excerpt);
+								} else {
+									tracker.beforeText();
+									process.stdout.write(
+										chalk.dim(`\n  💭  ${excerpt}\n`),
+									);
+								}
+								return;
+							}
+							case "tool_call": {
+								stopOnce();
+								const { name, preview } = parseAcpToolTitle(
+									update.title ?? "tool",
+								);
+								tracker.trackPreview(name, preview);
+								return;
+							}
+						}
+					},
+					onRequest: (message: AcpJsonRpcRequest) => {
+						if (message.method !== "session/request_permission") {
+							throw new Error(`Unsupported ACP request: ${message.method}`);
+						}
+
+						const params = asRecord(message.params);
+						const rawOptions = Array.isArray(params?.options)
+							? params.options
+							: [];
+						const options = rawOptions
+							.map((option) => asRecord(option))
+							.filter((option): option is Record<string, unknown> => option !== null)
+							.map((option) => ({
+								kind:
+									typeof option.kind === "string" ? option.kind : undefined,
+								optionId:
+									typeof option.optionId === "string"
+										? option.optionId
+										: undefined,
+							}));
+						const optionId = pickAcpPermissionOptionId(options);
+						return optionId
+							? { outcome: { outcome: "selected", optionId } }
+							: { outcome: { outcome: "cancelled" } };
+					},
+				},
+			);
+			await client.connect();
+
+			const cwd = this.opts.projectPath ?? process.cwd();
+			const previousSessionId = this.getProviderSessionId(provider);
+			const sessionResult = await client.request(
+				previousSessionId ? "session/load" : "session/new",
+				previousSessionId
+					? {
+							sessionId: previousSessionId,
+							...buildAcpSessionParams(cwd),
+						}
+					: buildAcpSessionParams(cwd),
+			);
+			const sessionId =
+				extractSessionId(sessionResult) ?? previousSessionId ?? null;
+			if (!sessionId) {
+				throw new Error(`ACP session did not return a session id for "${provider}"`);
+			}
+			await this.bindProviderSessionId(provider, sessionId);
+
+			await client.request("session/prompt", {
+				sessionId,
+				prompt: [{ type: "text", text: PLAN_INTENT_PREFIX + requestMessage }],
+			});
 			stopOnce();
 
-			const sessionId = final.session_id ?? run.session_id;
-			if (sessionId) {
-				await this.bindProviderSessionId(provider, sessionId);
-			}
-
-			const errorText = formatAcpError(final.error);
-			if (final.status === "failed") {
-				throw new Error(
-					errorText ?? `ACP run failed for provider "${provider}"`,
-				);
-			}
-			if (final.status === "cancelled") {
-				throw new Error(
-					errorText ?? `ACP run was cancelled for provider "${provider}"`,
-				);
-			}
-			if (final.status === "awaiting") {
-				throw new Error(
-					errorText ??
-						`ACP run is awaiting external input for provider "${provider}"`,
-				);
-			}
-
-			const fullText = extractAcpOutputText(final.output);
-			const planMatch = fullText.match(/^<bee:plan\s+goal="([^"]+)"\s*\/?>/);
+			const planMatch = fullText.trim().match(/^<bee:plan\s+goal="([^"]+)"\s*\/?>/);
 			if (planMatch) {
 				const goal = planMatch[1];
 				if (eventMode && goal) hooks?.onPlanIntent?.(goal);
 				else process.stdout.write(fullText);
-				return fullText;
+				return fullText.trim();
 			}
 
-			if (fullText) {
-				if (eventMode) hooks?.onText?.(fullText);
-				else process.stdout.write(fullText);
-			}
-			return fullText;
+			return fullText.trim();
 		} finally {
+			await client?.close().catch(() => undefined);
 			stopOnce();
+			tracker.finish();
+			this.accumulateStats(tracker.stats());
 		}
 	}
 
@@ -1085,88 +1202,6 @@ export class ChatSession {
 				.trim();
 			if (stderrClean) throw new Error(stderrClean);
 		}
-
-		return fullText.trim();
-	}
-
-	// ── Kimi ───────────────────────────────────────────────────────────────────
-	// Uses --session <id> for conversation continuation.
-	// First call: let Kimi allocate a session, capture from output.
-	// Subsequent calls: --session <id> resumes.
-
-	private async sendKimi(
-		userMessage: string,
-		hooks?: ChatRenderHooks,
-	): Promise<string> {
-		const eventMode = Boolean(hooks);
-		const stopSpinner = eventMode ? () => {} : startSpinner("thinking…");
-		const requestMessage = buildProviderRequest(
-			userMessage,
-			"kimi",
-			this._beeSession,
-		);
-
-		const args = ["kimi", "--print", requestMessage];
-		if (this._kimiSessionId) {
-			// Resume existing session
-			args.splice(1, 0, "--session", this._kimiSessionId);
-		}
-
-		const proc = Bun.spawn(args, {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-
-		const reader = proc.stdout.getReader();
-		const decoder = new TextDecoder();
-		let fullText = "";
-		let firstChunk = true;
-
-		try {
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
-				const chunk = decoder.decode(value, { stream: true });
-				if (!chunk) continue;
-				if (firstChunk) {
-					stopSpinner();
-					firstChunk = false;
-				}
-				if (eventMode) hooks?.onText?.(chunk);
-				else process.stdout.write(chunk);
-				fullText += chunk;
-			}
-		} finally {
-			reader.releaseLock();
-			stopSpinner();
-		}
-
-		await proc.exited;
-
-		const stderrText = await new Response(proc.stderr).text().catch(() => "");
-
-		// Capture Kimi session ID from stderr for future continuation
-		if (!this._kimiSessionId) {
-			const match = stderrText.match(/session[_\s]?(?:id)?[:\s]+([a-f0-9-]+)/i);
-			if (match) {
-				const kimiSessionId = match[1];
-				if (kimiSessionId) {
-					this._kimiSessionId = kimiSessionId;
-				}
-				if (kimiSessionId && this._sessionManager && this._beeSession) {
-					void this._sessionManager.bindNativeId(
-						this._beeSession,
-						"kimi",
-						kimiSessionId,
-					);
-				}
-			}
-		}
-
-		const authErr = detectAuthError(stderrText, "kimi");
-		if (authErr) throw new Error(authErr);
-		if (proc.exitCode !== 0 && stderrText.trim())
-			throw new Error(stderrText.trim());
 
 		return fullText.trim();
 	}

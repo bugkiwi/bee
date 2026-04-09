@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+	ChatSession,
 	buildAcpChatRequest,
 	buildProviderHandoff,
 	buildProviderRequest,
@@ -8,6 +9,7 @@ import { getAcpCommandConfig } from "../providers/acp/commands.ts";
 import { resolveAcpAgentName } from "../providers/acp/agents.ts";
 import { WorkspaceConfigSchema } from "../schema/config.schema.ts";
 import type { BeeSession } from "../session/manager.ts";
+import { DEFAULT_CONFIG } from "../types/config.ts";
 
 // ─── detectAuthError (copied inline for unit testing) ────────────────────────
 // The real function lives in chat.ts as a private module-level function.
@@ -179,6 +181,66 @@ describe("ACP chat request", () => {
 	it("uses the provider name as the ACP agent name fallback", () => {
 		const request = buildAcpChatRequest("hello", "custom-agent");
 		expect(request.agent_name).toBe("custom-agent");
+	});
+});
+
+describe("ChatSession ACP routing", () => {
+	it("treats shipped providers as ACP-backed without acp_base_url", () => {
+		for (const provider of ["claude", "codex", "kimi"]) {
+			const chat = new ChatSession({ ...DEFAULT_CONFIG, provider });
+			expect(
+				(chat as unknown as { shouldUseAcp: () => boolean }).shouldUseAcp(),
+			).toBe(true);
+		}
+
+		const custom = new ChatSession({ ...DEFAULT_CONFIG, provider: "custom" });
+		expect(
+			(custom as unknown as { shouldUseAcp: () => boolean }).shouldUseAcp(),
+		).toBe(false);
+	});
+
+	it("routes shipped providers through ACP without acp_base_url", async () => {
+		for (const provider of ["claude", "codex", "kimi"]) {
+			const chat = new ChatSession({ ...DEFAULT_CONFIG, provider });
+			let acpCalls = 0;
+			let nativeCalls = 0;
+
+			(
+				chat as unknown as {
+					sendViaAcp: (nextProvider: string, message: string) => Promise<string>;
+					sendClaude: (message: string) => Promise<string>;
+					sendCodex: (message: string) => Promise<string>;
+				}
+			).sendViaAcp = async (nextProvider, message) => {
+				acpCalls += 1;
+				expect(nextProvider).toBe(provider);
+				expect(message).toBe("hello");
+				return "acp-ok";
+			};
+			(
+				chat as unknown as {
+					sendClaude: (message: string) => Promise<string>;
+					sendCodex: (message: string) => Promise<string>;
+				}
+			).sendClaude = async () => {
+				nativeCalls += 1;
+				return "claude-native";
+			};
+			(
+				chat as unknown as {
+					sendClaude: (message: string) => Promise<string>;
+					sendCodex: (message: string) => Promise<string>;
+				}
+			).sendCodex = async () => {
+				nativeCalls += 1;
+				return "codex-native";
+			};
+
+			await chat.send("hello", {});
+
+			expect(acpCalls).toBe(1);
+			expect(nativeCalls).toBe(0);
+		}
 	});
 });
 

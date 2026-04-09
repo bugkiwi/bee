@@ -2,9 +2,15 @@ import type { AcpCommandConfig } from "./commands.ts";
 import type {
 	AcpJsonRpcErrorResponse,
 	AcpJsonRpcMessage,
+	AcpJsonRpcNotification,
 	AcpJsonRpcRequest,
 	AcpJsonRpcSuccessResponse,
 } from "./client.ts";
+
+interface StdioAcpClientOptions {
+	onNotification?: (message: AcpJsonRpcNotification) => void;
+	onRequest?: (message: AcpJsonRpcRequest) => Promise<unknown> | unknown;
+}
 
 export function createAcpStdioMessageBuffer() {
 	let remainder = "";
@@ -40,7 +46,10 @@ export class StdioAcpClient {
 	private stderrPromise: Promise<void> | null = null;
 	private stderrText = "";
 
-	constructor(private readonly commandConfig: AcpCommandConfig) {}
+	constructor(
+		private readonly commandConfig: AcpCommandConfig,
+		private readonly options: StdioAcpClientOptions = {},
+	) {}
 
 	async connect(): Promise<void> {
 		if (this.proc) return;
@@ -174,6 +183,16 @@ export class StdioAcpClient {
 	}
 
 	private handleMessage(message: AcpJsonRpcMessage): void {
+		if ("method" in message && "id" in message) {
+			void this.handleServerRequest(message);
+			return;
+		}
+
+		if ("method" in message) {
+			this.options.onNotification?.(message);
+			return;
+		}
+
 		if ("id" in message && "result" in message) {
 			this.resolvePending(message);
 			return;
@@ -181,6 +200,28 @@ export class StdioAcpClient {
 
 		if ("error" in message) {
 			this.rejectPending(message);
+		}
+	}
+
+	private async handleServerRequest(message: AcpJsonRpcRequest): Promise<void> {
+		try {
+			const result = await this.options.onRequest?.(message);
+			this.writeMessage({
+				jsonrpc: "2.0",
+				id: message.id,
+				result: result ?? null,
+			});
+		} catch (error) {
+			this.writeMessage({
+				jsonrpc: "2.0",
+				id: message.id,
+				error: {
+					message:
+						error instanceof Error
+							? error.message
+							: "ACP server request failed",
+				},
+			});
 		}
 	}
 
@@ -267,5 +308,18 @@ export class StdioAcpClient {
 			throw new Error("ACP stdio client stderr is not piped");
 		}
 		return stderr;
+	}
+
+	private writeMessage(message: Record<string, unknown>): void {
+		if (!this.proc) {
+			throw new Error("ACP stdio client is not connected");
+		}
+
+		const stdin = this.proc.stdin;
+		if (!stdin || typeof stdin === "number") {
+			throw new Error("ACP stdio client stdin is not piped");
+		}
+
+		stdin.write(`${JSON.stringify(message)}\n`);
 	}
 }
