@@ -52,6 +52,43 @@ export interface AcpRunStatus {
 	finished_at?: string;
 }
 
+export interface AcpJsonRpcError {
+	code?: number;
+	message: string;
+	data?: unknown;
+}
+
+export interface AcpJsonRpcRequest {
+	jsonrpc: "2.0";
+	id: number;
+	method: string;
+	params?: Record<string, unknown>;
+}
+
+export interface AcpJsonRpcNotification {
+	jsonrpc: "2.0";
+	method: string;
+	params?: Record<string, unknown>;
+}
+
+export interface AcpJsonRpcSuccessResponse {
+	jsonrpc: "2.0";
+	id: number;
+	result: unknown;
+}
+
+export interface AcpJsonRpcErrorResponse {
+	jsonrpc: "2.0";
+	id: number | null;
+	error: AcpJsonRpcError;
+}
+
+export type AcpJsonRpcMessage =
+	| AcpJsonRpcRequest
+	| AcpJsonRpcNotification
+	| AcpJsonRpcSuccessResponse
+	| AcpJsonRpcErrorResponse;
+
 function isTerminalStatus(status: AcpRunStatus["status"]): boolean {
 	return (
 		status === "completed" ||
