@@ -115,6 +115,7 @@ export class SessionManager {
     const providers = Object.entries(rawProviders).reduce<Record<string, ProviderBinding>>(
       (acc, [name, binding]) => {
         const provider = normalizeProviderName(name);
+        const prefersNormalizedNativeId = name !== provider && binding.nativeId !== null;
         const normalizedBinding: ProviderBinding = {
           ...binding,
           provider,
@@ -130,7 +131,9 @@ export class SessionManager {
         }
         acc[provider] = {
           ...existing,
-          nativeId: existing.nativeId ?? normalizedBinding.nativeId,
+          nativeId: prefersNormalizedNativeId
+            ? normalizedBinding.nativeId
+            : (existing.nativeId ?? normalizedBinding.nativeId),
           syncedThrough: Math.max(existing.syncedThrough, normalizedBinding.syncedThrough),
           tokens: Math.max(existing.tokens, normalizedBinding.tokens),
           cost: Math.max(existing.cost, normalizedBinding.cost),

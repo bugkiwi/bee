@@ -518,6 +518,89 @@ describe("ChatSession initSession", () => {
 				.at(-1)?.params?.sessionId,
 		).toBe("claude-legacy-session-42");
 	});
+
+	it("prefers the legacy claude-acp session id when mixed claude bindings are resumed", async () => {
+		const projectPath = join(baseDir, "project-chat-resume-mixed-claude-bindings");
+		await mkdir(projectPath, { recursive: true });
+		const mgr = new SessionManager(projectPath, baseDir);
+		const sessionId = "legacy-mixed-claude-session";
+		const sessionsDir = join(
+			baseDir,
+			"projects",
+			projectPathHash(projectPath),
+			"sessions",
+		);
+		await mkdir(sessionsDir, { recursive: true });
+		const claudeLog = join(baseDir, "claude-legacy-mixed-resume.jsonl");
+		await writeFile(
+			join(sessionsDir, `${sessionId}.json`),
+			JSON.stringify(
+				{
+					id: sessionId,
+					createdAt: "2026-01-01T00:00:00.000Z",
+					updatedAt: "2026-01-01T00:00:00.000Z",
+					projectPath,
+					activeProvider: "claude-acp",
+					providers: {
+						claude: {
+							provider: "claude",
+							nativeId: "claude-native-session-7",
+							syncedThrough: 1,
+							tokens: 10,
+							cost: 1,
+							lastActive: "2026-01-01T00:00:00.000Z",
+						},
+						"claude-acp": {
+							provider: "claude-acp",
+							nativeId: "claude-acp-session-99",
+							syncedThrough: 3,
+							tokens: 0,
+							cost: 0,
+							lastActive: "2026-01-01T00:00:01.000Z",
+						},
+					},
+					messageCount: 1,
+					transcriptSeq: 3,
+					transcript: [
+						{
+							type: "user",
+							text: "  › first",
+							at: "2026-01-01T00:00:00.000Z",
+							seq: 1,
+						},
+					],
+				},
+				null,
+				2,
+			),
+			"utf8",
+		);
+
+		const config = {
+			...DEFAULT_CONFIG,
+			provider: "kimi",
+			acp_commands: {
+				claude: createFakeAcpCommand("claude", claudeLog),
+			},
+		};
+		const chat = new ChatSession(config, { projectPath });
+		(chat as unknown as { _sessionManager: SessionManager })._sessionManager =
+			mgr;
+
+		const resumed = await chat.initSession({ resumeSessionId: sessionId });
+		await chat.send("resume mixed", {});
+		await Bun.sleep(25);
+
+		expect(resumed.providers.claude?.nativeId).toBe("claude-acp-session-99");
+		expect(resumed.providers["claude-acp"]).toBeUndefined();
+
+		const claudeMessages = await readJsonLines(claudeLog);
+		expect(
+			claudeMessages
+				.filter((message) => message.method === "session/load")
+				.at(-1)?.params?.sessionId,
+		).toBe("claude-acp-session-99");
+	});
 });
 
 describe("ChatSession switchProvider", () => {
