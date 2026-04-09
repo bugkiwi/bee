@@ -7,6 +7,7 @@ import {
 } from "../cli/chat.ts";
 import { getAcpCommandConfig } from "../providers/acp/commands.ts";
 import { resolveAcpAgentName } from "../providers/acp/agents.ts";
+import { ProviderRegistry } from "../providers/registry.ts";
 import { WorkspaceConfigSchema } from "../schema/config.schema.ts";
 import type { BeeSession } from "../session/manager.ts";
 import { DEFAULT_CONFIG } from "../types/config.ts";
@@ -117,6 +118,14 @@ describe("ACP chat request", () => {
 		).toThrow();
 	});
 
+	it("drops obsolete acp_base_url from parsed config", () => {
+		const config = WorkspaceConfigSchema.parse({
+			acp_base_url: "http://127.0.0.1:43110",
+		});
+
+		expect("acp_base_url" in config).toBe(false);
+	});
+
 	it("uses built-in stdio ACP defaults for the shipped providers", () => {
 		expect(getAcpCommandConfig("claude")).toEqual({
 			command: "npx",
@@ -184,6 +193,17 @@ describe("ACP chat request", () => {
 	});
 });
 
+describe("ProviderRegistry", () => {
+	it("lists only the shipped providers", () => {
+		const registry = new ProviderRegistry(DEFAULT_CONFIG);
+
+		expect(registry.list()).toEqual(["claude", "codex", "kimi"]);
+		expect(() => registry.get("claude-acp")).toThrow(
+			'Unknown provider: "claude-acp". Available: claude, codex, kimi',
+		);
+	});
+});
+
 describe("ChatSession ACP routing", () => {
 	it("treats shipped providers as ACP-backed without acp_base_url", () => {
 		for (const provider of ["claude", "codex", "kimi"]) {
@@ -197,17 +217,6 @@ describe("ChatSession ACP routing", () => {
 		expect(
 			(custom as unknown as { shouldUseAcp: () => boolean }).shouldUseAcp(),
 		).toBe(false);
-	});
-
-	it("keeps HTTP ACP available for legacy acp_base_url providers", () => {
-		const chat = new ChatSession({
-			...DEFAULT_CONFIG,
-			provider: "claude-acp",
-			acp_base_url: "http://127.0.0.1:43110",
-		});
-		expect(
-			(chat as unknown as { shouldUseAcp: () => boolean }).shouldUseAcp(),
-		).toBe(true);
 	});
 
 	it("routes shipped providers through ACP without acp_base_url", async () => {
@@ -254,11 +263,10 @@ describe("ChatSession ACP routing", () => {
 		}
 	});
 
-	it("routes legacy acp_base_url providers through ACP", async () => {
+	it("does not route unknown providers through ACP", async () => {
 		const chat = new ChatSession({
 			...DEFAULT_CONFIG,
-			provider: "claude-acp",
-			acp_base_url: "http://127.0.0.1:43110",
+			provider: "custom",
 		});
 		let acpCalls = 0;
 		let nativeCalls = 0;
@@ -268,25 +276,24 @@ describe("ChatSession ACP routing", () => {
 				sendViaAcp: (nextProvider: string, message: string) => Promise<string>;
 				sendClaude: (message: string) => Promise<string>;
 			}
-		).sendViaAcp = async (nextProvider, message) => {
+		).sendViaAcp = async (_nextProvider, _message) => {
 			acpCalls += 1;
-			expect(nextProvider).toBe("claude-acp");
-			expect(message).toBe("hello");
 			return "acp-ok";
 		};
 		(
 			chat as unknown as {
 				sendClaude: (message: string) => Promise<string>;
 			}
-		).sendClaude = async () => {
+		).sendClaude = async (message) => {
 			nativeCalls += 1;
+			expect(message).toBe("hello");
 			return "claude-native";
 		};
 
 		await chat.send("hello", {});
 
-		expect(acpCalls).toBe(1);
-		expect(nativeCalls).toBe(0);
+		expect(acpCalls).toBe(0);
+		expect(nativeCalls).toBe(1);
 	});
 });
 

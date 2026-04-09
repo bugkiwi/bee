@@ -491,7 +491,7 @@ describe("ChatSession switchProvider", () => {
 		const projectPath = join(baseDir, "project-chat-acp-provider-sessions");
 		await mkdir(projectPath, { recursive: true });
 		const mgr = new SessionManager(projectPath, baseDir);
-		const claudeLog = join(baseDir, "claude-acp.jsonl");
+		const claudeLog = join(baseDir, "claude-stdio.jsonl");
 		const codexLog = join(baseDir, "codex-acp.jsonl");
 		const config = {
 			...DEFAULT_CONFIG,

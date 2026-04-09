@@ -2,7 +2,6 @@ import type { IProvider } from "../types/provider.ts";
 import type { WorkspaceConfig } from "../types/config.ts";
 import { ClaudeProvider } from "./claude/index.ts";
 import { CodexProvider } from "./codex/index.ts";
-import { ClaudeAcpProvider } from "./acp/claude-acp.ts";
 import { KimiProvider } from "./kimi/index.ts";
 
 export class ProviderRegistry {
@@ -24,13 +23,6 @@ export class ProviderRegistry {
       "kimi",
       new KimiProvider({ timeoutMs: config.timeout_ms, useRtk })
     );
-
-    if (config.acp_base_url) {
-      this.providers.set(
-        "claude-acp",
-        new ClaudeAcpProvider(config.acp_base_url, config.timeout_ms)
-      );
-    }
   }
 
   get(name: string): IProvider {

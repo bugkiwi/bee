@@ -15,7 +15,6 @@ export const WorkspaceConfigSchema = z.object({
 			}),
 		)
 		.optional(),
-	acp_base_url: z.string().url().optional(),
 	acp_commands: z
 		.record(
 			z.object({
