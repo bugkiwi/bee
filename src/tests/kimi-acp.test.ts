@@ -4,11 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatSession } from "../cli/chat.ts";
 import type { AcpCommandConfig } from "../providers/acp/commands.ts";
-import {
-	buildKimiSessionParams,
-	extractKimiUpdateText,
-	pickKimiPermissionOptionId,
-} from "../providers/kimi/acp.ts";
 import { SessionManager } from "../session/manager.ts";
 import { DEFAULT_CONFIG } from "../types/config.ts";
 
@@ -118,54 +113,6 @@ async function readJsonLines(path: string): Promise<any[]> {
 		.filter((line) => line.trim().length > 0)
 		.map((line) => JSON.parse(line));
 }
-
-describe("buildKimiSessionParams", () => {
-	it("always sends an explicit cwd and empty MCP server list", () => {
-		expect(buildKimiSessionParams("/tmp/project")).toEqual({
-			cwd: "/tmp/project",
-			mcpServers: [],
-		});
-	});
-});
-
-describe("pickKimiPermissionOptionId", () => {
-	it("prefers session-wide allow over one-off allow and reject", () => {
-		expect(
-			pickKimiPermissionOptionId([
-				{ kind: "reject_once", name: "Reject", optionId: "reject" },
-				{ kind: "allow_once", name: "Approve once", optionId: "approve" },
-				{
-					kind: "allow_always",
-					name: "Approve for this session",
-					optionId: "approve_for_session",
-				},
-			]),
-		).toBe("approve_for_session");
-	});
-
-	it("falls back to the first option when no allow option exists", () => {
-		expect(
-			pickKimiPermissionOptionId([
-				{ kind: "reject_once", name: "Reject", optionId: "reject" },
-			]),
-		).toBe("reject");
-	});
-});
-
-describe("extractKimiUpdateText", () => {
-	it("extracts text from direct content chunks", () => {
-		expect(extractKimiUpdateText({ type: "text", text: "你好" })).toBe("你好");
-	});
-
-	it("extracts concatenated text from wrapped tool content", () => {
-		expect(
-			extractKimiUpdateText([
-				{ type: "content", content: { type: "text", text: "foo" } },
-				{ type: "content", content: { type: "text", text: "bar" } },
-			]),
-		).toBe("foobar");
-	});
-});
 
 describe("kimi stdio ACP integration", () => {
 	let baseDir: string;

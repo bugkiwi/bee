@@ -3,8 +3,11 @@ import { resolveAcpAgentName } from "../providers/acp/agents.ts";
 import type {
 	AcpJsonRpcNotification,
 	AcpJsonRpcRequest,
+	AcpMessage,
 	AcpRunRequest,
+	AcpRunStatus,
 } from "../providers/acp/client.ts";
+import { AcpClient } from "../providers/acp/client.ts";
 import { getAcpCommandConfig } from "../providers/acp/commands.ts";
 import { StdioAcpClient } from "../providers/acp/stdio-client.ts";
 import type { BeeSession, BeeTranscriptLine } from "../session/manager.ts";
@@ -395,6 +398,31 @@ function buildAcpSessionParams(cwd: string): {
 	};
 }
 
+function isAcpTerminalStatus(status: AcpRunStatus["status"]): boolean {
+	return (
+		status === "completed" ||
+		status === "failed" ||
+		status === "cancelled" ||
+		status === "awaiting"
+	);
+}
+
+function formatAcpError(error: AcpRunStatus["error"]): string | null {
+	if (!error) return null;
+	if (typeof error === "string") return error;
+	return error.message ?? null;
+}
+
+function extractAcpOutputText(output: AcpMessage[] | undefined): string {
+	if (!output?.length) return "";
+	return output
+		.filter((message) => message.role !== "user")
+		.flatMap((message) => message.parts)
+		.map((part) => part.content)
+		.join("\n")
+		.trim();
+}
+
 function pickAcpPermissionOptionId(
 	options: AcpPermissionOption[],
 ): string | null {
@@ -476,6 +504,8 @@ export class ChatSession {
 	private _claudeSessionId: string | null = null;
 	private _codexSessionId: string | null = null;
 	private _kimiSessionId: string | null = null;
+	private _acpClient: AcpClient | null = null;
+	private _acpClientBaseUrl: string | null = null;
 
 	// ── Persistent session (optional) ────────────────────────────────────────
 	private _sessionManager: SessionManager | null = null;
@@ -607,8 +637,26 @@ export class ChatSession {
 		return this._beeSession;
 	}
 
-	private shouldUseAcp(provider = this.config.provider): boolean {
+	private shouldUseLocalAcp(provider = this.config.provider): boolean {
 		return provider === "claude" || provider === "codex" || provider === "kimi";
+	}
+
+	private shouldUseAcp(provider = this.config.provider): boolean {
+		return this.shouldUseLocalAcp(provider) || Boolean(this.config.acp_base_url);
+	}
+
+	private getHttpAcpClient(): AcpClient {
+		const baseUrl = this.config.acp_base_url?.trim();
+		if (!baseUrl) {
+			throw new Error(
+				"ACP is not configured. Set acp_base_url in .bee/config.json.",
+			);
+		}
+		if (!this._acpClient || this._acpClientBaseUrl !== baseUrl) {
+			this._acpClient = new AcpClient(baseUrl, this.config.timeout_ms);
+			this._acpClientBaseUrl = baseUrl;
+		}
+		return this._acpClient;
 	}
 
 	private getProviderSessionId(provider: string): string | null {
@@ -714,6 +762,17 @@ export class ChatSession {
 	}
 
 	private async sendViaAcp(
+		provider: string,
+		userMessage: string,
+		hooks?: ChatRenderHooks,
+	): Promise<string> {
+		if (this.shouldUseLocalAcp(provider)) {
+			return this.sendViaLocalAcp(provider, userMessage, hooks);
+		}
+		return this.sendViaHttpAcp(provider, userMessage, hooks);
+	}
+
+	private async sendViaLocalAcp(
 		provider: string,
 		userMessage: string,
 		hooks?: ChatRenderHooks,
@@ -863,6 +922,87 @@ export class ChatSession {
 			stopOnce();
 			tracker.finish();
 			this.accumulateStats(tracker.stats());
+		}
+	}
+
+	private async sendViaHttpAcp(
+		provider: string,
+		userMessage: string,
+		hooks?: ChatRenderHooks,
+	): Promise<string> {
+		const eventMode = Boolean(hooks);
+		const stopSpinner = eventMode ? () => {} : startSpinner("thinking…");
+		let spinnerStopped = false;
+		const requestMessage = buildProviderRequest(
+			userMessage,
+			provider,
+			this._beeSession,
+		);
+		const request = buildAcpChatRequest(
+			PLAN_INTENT_PREFIX + requestMessage,
+			provider,
+			this.config,
+			this.getProviderSessionId(provider),
+		);
+
+		const stopOnce = () => {
+			if (!spinnerStopped) {
+				stopSpinner();
+				spinnerStopped = true;
+			}
+		};
+
+		try {
+			const client = this.getHttpAcpClient();
+			const run = await client.createRun(request);
+			if (run.session_id) {
+				await this.bindProviderSessionId(provider, run.session_id);
+			}
+
+			const final = isAcpTerminalStatus(run.status)
+				? run
+				: await client.waitForCompletion(run.run_id, 1000);
+			stopOnce();
+
+			const sessionId = final.session_id ?? run.session_id;
+			if (sessionId) {
+				await this.bindProviderSessionId(provider, sessionId);
+			}
+
+			const errorText = formatAcpError(final.error);
+			if (final.status === "failed") {
+				throw new Error(
+					errorText ?? `ACP run failed for provider "${provider}"`,
+				);
+			}
+			if (final.status === "cancelled") {
+				throw new Error(
+					errorText ?? `ACP run was cancelled for provider "${provider}"`,
+				);
+			}
+			if (final.status === "awaiting") {
+				throw new Error(
+					errorText ??
+						`ACP run is awaiting external input for provider "${provider}"`,
+				);
+			}
+
+			const fullText = extractAcpOutputText(final.output);
+			const planMatch = fullText.match(/^<bee:plan\s+goal="([^"]+)"\s*\/?>/);
+			if (planMatch) {
+				const goal = planMatch[1];
+				if (eventMode && goal) hooks?.onPlanIntent?.(goal);
+				else process.stdout.write(fullText);
+				return fullText;
+			}
+
+			if (fullText) {
+				if (eventMode) hooks?.onText?.(fullText);
+				else process.stdout.write(fullText);
+			}
+			return fullText;
+		} finally {
+			stopOnce();
 		}
 	}
 

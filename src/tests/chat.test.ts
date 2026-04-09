@@ -199,6 +199,17 @@ describe("ChatSession ACP routing", () => {
 		).toBe(false);
 	});
 
+	it("keeps HTTP ACP available for legacy acp_base_url providers", () => {
+		const chat = new ChatSession({
+			...DEFAULT_CONFIG,
+			provider: "claude-acp",
+			acp_base_url: "http://127.0.0.1:43110",
+		});
+		expect(
+			(chat as unknown as { shouldUseAcp: () => boolean }).shouldUseAcp(),
+		).toBe(true);
+	});
+
 	it("routes shipped providers through ACP without acp_base_url", async () => {
 		for (const provider of ["claude", "codex", "kimi"]) {
 			const chat = new ChatSession({ ...DEFAULT_CONFIG, provider });
@@ -241,6 +252,41 @@ describe("ChatSession ACP routing", () => {
 			expect(acpCalls).toBe(1);
 			expect(nativeCalls).toBe(0);
 		}
+	});
+
+	it("routes legacy acp_base_url providers through ACP", async () => {
+		const chat = new ChatSession({
+			...DEFAULT_CONFIG,
+			provider: "claude-acp",
+			acp_base_url: "http://127.0.0.1:43110",
+		});
+		let acpCalls = 0;
+		let nativeCalls = 0;
+
+		(
+			chat as unknown as {
+				sendViaAcp: (nextProvider: string, message: string) => Promise<string>;
+				sendClaude: (message: string) => Promise<string>;
+			}
+		).sendViaAcp = async (nextProvider, message) => {
+			acpCalls += 1;
+			expect(nextProvider).toBe("claude-acp");
+			expect(message).toBe("hello");
+			return "acp-ok";
+		};
+		(
+			chat as unknown as {
+				sendClaude: (message: string) => Promise<string>;
+			}
+		).sendClaude = async () => {
+			nativeCalls += 1;
+			return "claude-native";
+		};
+
+		await chat.send("hello", {});
+
+		expect(acpCalls).toBe(1);
+		expect(nativeCalls).toBe(0);
 	});
 });
 
