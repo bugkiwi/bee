@@ -9,7 +9,10 @@ import { getAcpCommandConfig } from "../providers/acp/commands.ts";
 import { StdioAcpClient } from "../providers/acp/stdio-client.ts";
 import type { BeeSession, BeeTranscriptLine } from "../session/manager.ts";
 import { SessionManager } from "../session/manager.ts";
-import type { WorkspaceConfig } from "../types/config.ts";
+import {
+	normalizeProviderName,
+	type WorkspaceConfig,
+} from "../types/config.ts";
 import type { ToolDiffMeta } from "../types/transcript.ts";
 import { createToolDiffPreview } from "../utils/diff-preview.ts";
 import { stripAnsi } from "../utils/strip-ansi.ts";
@@ -512,6 +515,8 @@ export class ChatSession {
 		private config: WorkspaceConfig,
 		private opts: ChatOptions = {},
 	) {
+		config.provider = normalizeProviderName(config.provider);
+		this.config = config;
 		if (opts.projectPath) {
 			this._sessionManager = new SessionManager(opts.projectPath);
 		}
@@ -567,13 +572,14 @@ export class ChatSession {
 
 	/** Switch active provider for both runtime config and persisted bee session. */
 	async switchProvider(to: string): Promise<void> {
-		this.config.provider = to;
+		const provider = normalizeProviderName(to);
+		this.config.provider = provider;
 		if (this._sessionManager && this._beeSession) {
-			await this._sessionManager.switchProvider(this._beeSession, to);
+			await this._sessionManager.switchProvider(this._beeSession, provider);
 			return;
 		}
 		if (this._beeSession) {
-			this._beeSession.activeProvider = to;
+			this._beeSession.activeProvider = provider;
 		}
 	}
 
@@ -625,7 +631,9 @@ export class ChatSession {
 			}
 			this._messageCount = existing.messageCount;
 			if (existing.activeProvider) {
-				this.config.provider = existing.activeProvider;
+				const provider = normalizeProviderName(existing.activeProvider);
+				existing.activeProvider = provider;
+				this.config.provider = provider;
 			}
 			return existing;
 		}

@@ -10,7 +10,11 @@ import { resolveAcpAgentName } from "../providers/acp/agents.ts";
 import { ProviderRegistry } from "../providers/registry.ts";
 import { WorkspaceConfigSchema } from "../schema/config.schema.ts";
 import type { BeeSession } from "../session/manager.ts";
-import { DEFAULT_CONFIG } from "../types/config.ts";
+import {
+	DEFAULT_CONFIG,
+	normalizeProviderName,
+	normalizeWorkspaceConfig,
+} from "../types/config.ts";
 
 // ─── detectAuthError (copied inline for unit testing) ────────────────────────
 // The real function lives in chat.ts as a private module-level function.
@@ -204,6 +208,18 @@ describe("ProviderRegistry", () => {
 	});
 });
 
+describe("provider normalization", () => {
+	it("maps stale claude-acp aliases onto claude", () => {
+		expect(normalizeProviderName("claude-acp")).toBe("claude");
+		expect(
+			normalizeWorkspaceConfig({
+				...DEFAULT_CONFIG,
+				provider: "claude-acp",
+			}).provider,
+		).toBe("claude");
+	});
+});
+
 describe("ChatSession ACP routing", () => {
 	it("treats shipped providers as ACP-backed without acp_base_url", () => {
 		for (const provider of ["claude", "codex", "kimi"]) {
@@ -261,6 +277,43 @@ describe("ChatSession ACP routing", () => {
 			expect(acpCalls).toBe(1);
 			expect(nativeCalls).toBe(0);
 		}
+	});
+
+	it("normalizes stale claude-acp config onto the claude stdio ACP path", async () => {
+		const config = { ...DEFAULT_CONFIG, provider: "claude-acp" };
+		const chat = new ChatSession(config);
+		let acpCalls = 0;
+		let nativeCalls = 0;
+
+		expect(config.provider).toBe("claude");
+		expect(
+			(chat as unknown as { shouldUseAcp: () => boolean }).shouldUseAcp(),
+		).toBe(true);
+
+		(
+			chat as unknown as {
+				sendViaAcp: (nextProvider: string, message: string) => Promise<string>;
+				sendClaude: (message: string) => Promise<string>;
+			}
+		).sendViaAcp = async (nextProvider, message) => {
+			acpCalls += 1;
+			expect(nextProvider).toBe("claude");
+			expect(message).toBe("hello");
+			return "acp-ok";
+		};
+		(
+			chat as unknown as {
+				sendClaude: (message: string) => Promise<string>;
+			}
+		).sendClaude = async () => {
+			nativeCalls += 1;
+			return "claude-native";
+		};
+
+		await chat.send("hello", {});
+
+		expect(acpCalls).toBe(1);
+		expect(nativeCalls).toBe(0);
 	});
 
 	it("does not route unknown providers through ACP", async () => {

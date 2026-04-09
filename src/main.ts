@@ -4,7 +4,11 @@ import { runRepl as runInkRepl } from "./cli/repl-ink.tsx";
 import { restoreTerminalAfterCrash } from "./cli/ui/terminal.ts";
 import { findWorkspaceRoot, getWorkspaceDirs } from "./utils/workspace.ts";
 import { readJsonFile, fileExists, writeJsonFile } from "./utils/fs.ts";
-import { DEFAULT_CONFIG, type WorkspaceConfig } from "./types/config.ts";
+import {
+  DEFAULT_CONFIG,
+  normalizeWorkspaceConfig,
+  type WorkspaceConfig,
+} from "./types/config.ts";
 import { WorkspaceConfigSchema } from "./schema/config.schema.ts";
 import { runFirstRunWizardInk } from "./cli/wizard-ink.tsx";
 import {
@@ -26,7 +30,9 @@ async function loadConfig(configPath: string): Promise<WorkspaceConfig> {
   try {
     const raw = await readJsonFile(configPath);
     const parsed = WorkspaceConfigSchema.safeParse(raw);
-    return parsed.success ? (parsed.data as WorkspaceConfig) : DEFAULT_CONFIG;
+    return parsed.success
+      ? normalizeWorkspaceConfig(parsed.data as WorkspaceConfig)
+      : DEFAULT_CONFIG;
   } catch {
     return DEFAULT_CONFIG;
   }

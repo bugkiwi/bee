@@ -41,3 +41,14 @@ export const DEFAULT_CONFIG: WorkspaceConfig = {
 		"codex-mini-latest": { input_per_1m: 1.5, output_per_1m: 6.0 },
 	},
 };
+
+export function normalizeProviderName(provider: string): string {
+	return provider === "claude-acp" ? "claude" : provider;
+}
+
+export function normalizeWorkspaceConfig(
+	config: WorkspaceConfig,
+): WorkspaceConfig {
+	const provider = normalizeProviderName(config.provider);
+	return provider === config.provider ? config : { ...config, provider };
+}

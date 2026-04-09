@@ -1,7 +1,12 @@
 import { Command } from "commander";
 import { findWorkspaceRoot, getWorkspaceDirs } from "../utils/workspace.ts";
 import { readJsonFile } from "../utils/fs.ts";
-import { DEFAULT_CONFIG, type WorkspaceConfig } from "../types/config.ts";
+import {
+  DEFAULT_CONFIG,
+  normalizeProviderName,
+  normalizeWorkspaceConfig,
+  type WorkspaceConfig,
+} from "../types/config.ts";
 import { WorkspaceConfigSchema } from "../schema/config.schema.ts";
 
 import { runInit } from "./commands/init.ts";
@@ -17,7 +22,9 @@ async function loadConfig(configPath: string): Promise<WorkspaceConfig> {
   try {
     const raw = await readJsonFile(configPath);
     const parsed = WorkspaceConfigSchema.safeParse(raw);
-    return parsed.success ? (parsed.data as WorkspaceConfig) : DEFAULT_CONFIG;
+    return parsed.success
+      ? normalizeWorkspaceConfig(parsed.data as WorkspaceConfig)
+      : DEFAULT_CONFIG;
   } catch {
     return DEFAULT_CONFIG;
   }
@@ -57,7 +64,7 @@ export function buildCli(): Command {
       const root = findWorkspaceRoot();
       const dirs = getWorkspaceDirs(root);
       const config = await loadConfig(dirs.config);
-      if (opts.provider) config.provider = opts.provider;
+      if (opts.provider) config.provider = normalizeProviderName(opts.provider);
       await runRun(config, dirs, { taskId, dryRun: opts.dryRun, verbose: opts.verbose });
     });
 
@@ -102,7 +109,7 @@ export function buildCli(): Command {
       const root = findWorkspaceRoot();
       const dirs = getWorkspaceDirs(root);
       const config = await loadConfig(dirs.config);
-      if (opts.provider) config.provider = opts.provider;
+      if (opts.provider) config.provider = normalizeProviderName(opts.provider);
       if (opts.pause) config.pause_between_nodes = true;
       await runSkeleton(goal, config, dirs);
     });
@@ -115,7 +122,7 @@ export function buildCli(): Command {
       const root = findWorkspaceRoot();
       const dirs = getWorkspaceDirs(root);
       const config = await loadConfig(dirs.config);
-      if (opts.provider) config.provider = opts.provider;
+      if (opts.provider) config.provider = normalizeProviderName(opts.provider);
       await runAsk(goal, config, dirs);
     });
 
