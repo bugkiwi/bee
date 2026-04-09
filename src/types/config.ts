@@ -46,9 +46,38 @@ export function normalizeProviderName(provider: string): string {
 	return provider === "claude-acp" ? "claude" : provider;
 }
 
+function normalizeProviderKeyedRecord<T>(
+	record?: Record<string, T>,
+): Record<string, T> | undefined {
+	if (!record) return undefined;
+
+	const normalized: Record<string, T> = {};
+	for (const [key, value] of Object.entries(record)) {
+		const provider = normalizeProviderName(key);
+		if (!(provider in normalized)) {
+			normalized[provider] = value;
+		}
+	}
+	return normalized;
+}
+
 export function normalizeWorkspaceConfig(
 	config: WorkspaceConfig,
 ): WorkspaceConfig {
 	const provider = normalizeProviderName(config.provider);
-	return provider === config.provider ? config : { ...config, provider };
+	const acpCommands = normalizeProviderKeyedRecord(config.acp_commands);
+	const acpAgentNames = normalizeProviderKeyedRecord(config.acp_agent_names);
+	if (
+		provider === config.provider &&
+		acpCommands === config.acp_commands &&
+		acpAgentNames === config.acp_agent_names
+	) {
+		return config;
+	}
+	return {
+		...config,
+		provider,
+		...(acpCommands ? { acp_commands: acpCommands } : {}),
+		...(acpAgentNames ? { acp_agent_names: acpAgentNames } : {}),
+	};
 }

@@ -150,6 +150,34 @@ process.stdin.on("data", (chunk) => {
 		expect(outcome.status).toBe("rejected");
 	});
 
+	it("accepts a final initialize response frame without a trailing newline", async () => {
+		const client = new StdioAcpClient(
+			createNodeCommandConfig(`
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+	buffer += chunk;
+	const lines = buffer.split("\\n");
+	buffer = lines.pop() ?? "";
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		const message = JSON.parse(line);
+		if (message.method === "initialize") {
+			process.stdout.write(JSON.stringify({
+				jsonrpc: "2.0",
+				id: message.id,
+				result: { initialized: true },
+			}));
+			process.exit(0);
+		}
+	}
+});
+`),
+		);
+
+		await expect(client.connect()).resolves.toBeUndefined();
+	});
+
 	it("rejects pending requests when stdio closes before a response arrives", async () => {
 		const client = new StdioAcpClient(
 			createNodeCommandConfig(`

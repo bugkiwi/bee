@@ -15,14 +15,26 @@ interface StdioAcpClientOptions {
 
 export function createAcpStdioMessageBuffer() {
 	let remainder = "";
+	const parseLines = (input: string): AcpJsonRpcMessage[] =>
+		input
+			.split("\n")
+			.filter((line) => line.trim().length > 0)
+			.map((line) => JSON.parse(line) as AcpJsonRpcMessage);
 	return {
 		push(chunk: string): AcpJsonRpcMessage[] {
 			const input = remainder + chunk;
 			const lines = input.split("\n");
 			remainder = lines.pop() ?? "";
-			return lines
-				.filter((line) => line.trim().length > 0)
-				.map((line) => JSON.parse(line) as AcpJsonRpcMessage);
+			return parseLines(lines.join("\n"));
+		},
+		flush(): AcpJsonRpcMessage[] {
+			if (remainder.trim().length === 0) {
+				remainder = "";
+				return [];
+			}
+			const messages = parseLines(remainder);
+			remainder = "";
+			return messages;
 		},
 	};
 }
@@ -146,6 +158,12 @@ export class StdioAcpClient {
 			while (true) {
 				const { done, value } = await reader.read();
 				if (done) {
+					for (const message of buffer.push(decoder.decode())) {
+						this.handleMessage(message);
+					}
+					for (const message of buffer.flush()) {
+						this.handleMessage(message);
+					}
 					await this.handleProcessEnd(proc);
 					break;
 				}

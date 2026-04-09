@@ -11,6 +11,7 @@ import type { BeeSession, BeeTranscriptLine } from "../session/manager.ts";
 import { SessionManager } from "../session/manager.ts";
 import {
 	normalizeProviderName,
+	normalizeWorkspaceConfig,
 	type WorkspaceConfig,
 } from "../types/config.ts";
 import type { ToolDiffMeta } from "../types/transcript.ts";
@@ -515,7 +516,7 @@ export class ChatSession {
 		private config: WorkspaceConfig,
 		private opts: ChatOptions = {},
 	) {
-		config.provider = normalizeProviderName(config.provider);
+		Object.assign(config, normalizeWorkspaceConfig(config));
 		this.config = config;
 		if (opts.projectPath) {
 			this._sessionManager = new SessionManager(opts.projectPath);
@@ -934,6 +935,10 @@ export class ChatSession {
 			}
 
 			return fullText.trim();
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const authErr = detectAuthError(message, provider);
+			throw new Error(authErr ?? message);
 		} finally {
 			await client?.close().catch(() => undefined);
 			stopOnce();

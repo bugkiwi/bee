@@ -7,6 +7,7 @@ import {
 } from "../cli/chat.ts";
 import { getAcpCommandConfig } from "../providers/acp/commands.ts";
 import { resolveAcpAgentName } from "../providers/acp/agents.ts";
+import { StdioAcpClient } from "../providers/acp/stdio-client.ts";
 import { ProviderRegistry } from "../providers/registry.ts";
 import { WorkspaceConfigSchema } from "../schema/config.schema.ts";
 import type { BeeSession } from "../session/manager.ts";
@@ -218,6 +219,29 @@ describe("provider normalization", () => {
 			}).provider,
 		).toBe("claude");
 	});
+
+	it("migrates claude-acp keyed ACP overrides onto claude", () => {
+		const config = normalizeWorkspaceConfig({
+			...DEFAULT_CONFIG,
+			provider: "claude-acp",
+			acp_commands: {
+				"claude-acp": {
+					command: "legacy-claude-acp",
+					args: ["--stdio"],
+				},
+			},
+			acp_agent_names: {
+				"claude-acp": "legacy-claude-agent",
+			},
+		});
+
+		expect(getAcpCommandConfig("claude", config)).toEqual({
+			command: "legacy-claude-acp",
+			args: ["--stdio"],
+			env: {},
+		});
+		expect(resolveAcpAgentName("claude", config)).toBe("legacy-claude-agent");
+	});
 });
 
 describe("ChatSession ACP routing", () => {
@@ -347,6 +371,37 @@ describe("ChatSession ACP routing", () => {
 
 		expect(acpCalls).toBe(0);
 		expect(nativeCalls).toBe(1);
+	});
+
+	it("keeps auth remediation hints for shipped providers on stdio ACP failures", async () => {
+		const originalConnect = StdioAcpClient.prototype.connect;
+
+		try {
+			for (const [provider, rawError, expectedHint] of [
+				["claude", "not authenticated", "Claude not authenticated"],
+				["codex", "OPENAI_API_KEY not set", "OPENAI_API_KEY"],
+				["kimi", "MOONSHOT_API_KEY missing", "MOONSHOT_API_KEY"],
+			] as const) {
+				StdioAcpClient.prototype.connect = async function () {
+					throw new Error(rawError);
+				};
+
+				const chat = new ChatSession({ ...DEFAULT_CONFIG, provider });
+				await expect(
+					(
+						chat as unknown as {
+							sendViaLocalAcp: (
+								nextProvider: string,
+								message: string,
+								hooks?: Record<string, never>,
+							) => Promise<string>;
+						}
+					).sendViaLocalAcp(provider, "hello", {}),
+				).rejects.toThrow(expectedHint);
+			}
+		} finally {
+			StdioAcpClient.prototype.connect = originalConnect;
+		}
 	});
 });
 
