@@ -8,6 +8,7 @@ import type {
 } from "./client.ts";
 
 interface StdioAcpClientOptions {
+	cwd?: string;
 	onNotification?: (message: AcpJsonRpcNotification) => void;
 	onRequest?: (message: AcpJsonRpcRequest) => Promise<unknown> | unknown;
 }
@@ -57,6 +58,7 @@ export class StdioAcpClient {
 		const proc = Bun.spawn(
 			[this.commandConfig.command, ...this.commandConfig.args],
 			{
+				cwd: this.options.cwd,
 				stdin: "pipe",
 				stdout: "pipe",
 				stderr: "pipe",

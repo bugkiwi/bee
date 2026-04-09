@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	createAcpStdioMessageBuffer,
 	nextJsonRpcId,
@@ -91,6 +94,50 @@ process.stdin.on("data", (chunk) => {
 			});
 		} finally {
 			await client.close();
+		}
+	});
+
+	it("spawns the ACP subprocess in the provided cwd", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "bee-acp-cwd-"));
+		const resolvedCwd = await realpath(cwd);
+		const client = new StdioAcpClient(
+			createNodeCommandConfig(`
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+	buffer += chunk;
+	const lines = buffer.split("\\n");
+	buffer = lines.pop() ?? "";
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		const message = JSON.parse(line);
+		if (message.method === "initialize") {
+			process.stdout.write(JSON.stringify({
+				jsonrpc: "2.0",
+				id: message.id,
+				result: { initialized: true },
+			}) + "\\n");
+		} else if (message.method === "ping") {
+			process.stdout.write(JSON.stringify({
+				jsonrpc: "2.0",
+				id: message.id,
+				result: { cwd: process.cwd() },
+			}) + "\\n");
+		}
+	}
+});
+`),
+			{ cwd },
+		);
+
+		try {
+			await client.connect();
+			await expect(client.request("ping", {})).resolves.toEqual({
+				cwd: resolvedCwd,
+			});
+		} finally {
+			await client.close();
+			await rm(cwd, { recursive: true, force: true });
 		}
 	});
 

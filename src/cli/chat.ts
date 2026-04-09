@@ -262,6 +262,8 @@ export interface ChatRenderHooks {
 const PLAN_INTENT_PREFIX = `[If the following message is a software development task (build, fix, implement, create, add, migrate, refactor, debug, or similar — in ANY human language), respond ONLY with: <bee:plan goal="<concise English goal>"/>. Otherwise respond normally.]
 
 `;
+const PLAN_MARKER_START = "<bee:plan";
+const PLAN_MARKER_REGEX = /^<bee:plan\s+goal="([^"]+)"\s*\/?>/;
 
 export interface ChatOptions {
 	/** Called with a message when the session starts working, null when done. */
@@ -470,6 +472,31 @@ function extractSessionId(value: unknown): string | null {
 	return typeof sessionId === "string" && sessionId.length > 0
 		? sessionId
 		: null;
+}
+
+function classifyInitialPlanMarker(buffer: string): {
+	kind: "pending" | "plan" | "text";
+	goal?: string;
+} {
+	const trimmed = buffer.trimStart();
+	if (!trimmed) return { kind: "pending" };
+
+	if (trimmed.length < PLAN_MARKER_START.length) {
+		return PLAN_MARKER_START.startsWith(trimmed)
+			? { kind: "pending" }
+			: { kind: "text" };
+	}
+
+	if (!trimmed.startsWith(PLAN_MARKER_START)) {
+		return { kind: "text" };
+	}
+
+	const match = trimmed.match(PLAN_MARKER_REGEX);
+	if (match?.[1]) {
+		return { kind: "plan", goal: match[1] };
+	}
+
+	return trimmed.includes(">") ? { kind: "text" } : { kind: "pending" };
 }
 
 export function buildAcpChatRequest(
@@ -787,9 +814,11 @@ export class ChatSession {
 			onToolDiff: (meta) => hooks?.onToolDiff?.(meta),
 			onSummary: (summary) => hooks?.onToolSummary?.(summary),
 		});
+		const cwd = this.opts.projectPath ?? process.cwd();
 		let fullText = "";
-		let firstTextSeen = false;
-		let planMarkerDetected = false;
+		let initialTextState: "pending" | "plan" | "text" = "pending";
+		let initialTextBuffer = "";
+		let planGoal: string | null = null;
 		const requestMessage = buildProviderRequest(
 			userMessage,
 			provider,
@@ -803,10 +832,18 @@ export class ChatSession {
 			}
 		};
 
+		const emitText = (text: string) => {
+			if (!text) return;
+			tracker.beforeText();
+			if (eventMode) hooks?.onText?.(text);
+			else process.stdout.write(text);
+		};
+
 		try {
 			client = new StdioAcpClient(
 				getAcpCommandConfig(provider, this.config),
 				{
+					cwd,
 					onNotification: (message: AcpJsonRpcNotification) => {
 						if (message.method !== "session/update") return;
 						const params = asRecord(message.params);
@@ -819,16 +856,32 @@ export class ChatSession {
 								if (!text) return;
 								stopOnce();
 								fullText += text;
-								if (!firstTextSeen) {
-									firstTextSeen = true;
-									if (fullText.trimStart().startsWith("<bee:plan")) {
-										planMarkerDetected = true;
-									}
+								if (initialTextState === "plan") {
+									return;
 								}
-								if (planMarkerDetected) return;
-								tracker.beforeText();
-								if (eventMode) hooks?.onText?.(text);
-								else process.stdout.write(text);
+
+								if (initialTextState === "text") {
+									emitText(text);
+									return;
+								}
+
+								initialTextBuffer += text;
+								const classification = classifyInitialPlanMarker(
+									initialTextBuffer,
+								);
+								if (classification.kind === "pending") {
+									return;
+								}
+
+								if (classification.kind === "plan") {
+									initialTextState = "plan";
+									planGoal = classification.goal ?? null;
+									return;
+								}
+
+								initialTextState = "text";
+								emitText(initialTextBuffer);
+								initialTextBuffer = "";
 								return;
 							}
 							case "agent_thought_chunk": {
@@ -884,7 +937,6 @@ export class ChatSession {
 			);
 			await client.connect();
 
-			const cwd = this.opts.projectPath ?? process.cwd();
 			const previousSessionId = this.getProviderSessionId(provider);
 			const sessionResult = await client.request(
 				previousSessionId ? "session/load" : "session/new",
@@ -908,10 +960,14 @@ export class ChatSession {
 			});
 			stopOnce();
 
-			const planMatch = fullText.trim().match(/^<bee:plan\s+goal="([^"]+)"\s*\/?>/);
-			if (planMatch) {
-				const goal = planMatch[1];
-				if (eventMode && goal) hooks?.onPlanIntent?.(goal);
+			if (initialTextState === "pending" && initialTextBuffer) {
+				initialTextState = "text";
+				emitText(initialTextBuffer);
+				initialTextBuffer = "";
+			}
+
+			if (planGoal) {
+				if (eventMode) hooks?.onPlanIntent?.(planGoal);
 				else process.stdout.write(fullText);
 				return fullText.trim();
 			}

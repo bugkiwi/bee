@@ -488,7 +488,8 @@ describe("ChatSession switchProvider", () => {
 	});
 
 	it("persists provider-scoped ACP session ids and reloads the matching provider session", async () => {
-		const projectPath = "/Users/test/Work/project-chat-acp-provider-sessions";
+		const projectPath = join(baseDir, "project-chat-acp-provider-sessions");
+		await mkdir(projectPath, { recursive: true });
 		const mgr = new SessionManager(projectPath, baseDir);
 		const claudeLog = join(baseDir, "claude-acp.jsonl");
 		const codexLog = join(baseDir, "codex-acp.jsonl");
