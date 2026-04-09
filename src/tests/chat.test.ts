@@ -4,6 +4,7 @@ import {
 	buildProviderHandoff,
 	buildProviderRequest,
 } from "../cli/chat.ts";
+import { getAcpCommandConfig } from "../providers/acp/commands.ts";
 import { resolveAcpAgentName } from "../providers/acp/agents.ts";
 import type { BeeSession } from "../session/manager.ts";
 
@@ -83,6 +84,38 @@ describe("detectAuthError", () => {
 });
 
 describe("ACP chat request", () => {
+	it("uses built-in stdio ACP defaults for the shipped providers", () => {
+		expect(getAcpCommandConfig("claude")).toEqual({
+			command: "npx",
+			args: ["-y", "@zed-industries/claude-code-acp"],
+			env: {},
+		});
+		expect(getAcpCommandConfig("codex")).toEqual({
+			command: "npx",
+			args: ["-y", "@zed-industries/codex-acp"],
+			env: {},
+		});
+		expect(getAcpCommandConfig("kimi")).toEqual({
+			command: "kimi",
+			args: ["acp"],
+			env: {},
+		});
+	});
+
+	it("honors acp_commands overrides", () => {
+		expect(
+			getAcpCommandConfig("codex", {
+				acp_commands: {
+					codex: { command: "codex-acp", args: ["--verbose"] },
+				},
+			}),
+		).toEqual({
+			command: "codex-acp",
+			args: ["--verbose"],
+			env: {},
+		});
+	});
+
 	it("uses default ACP agent names", () => {
 		expect(resolveAcpAgentName("claude")).toBe("claude-code");
 		expect(resolveAcpAgentName("codex")).toBe("codex");

@@ -8,6 +8,10 @@ export interface WorkspaceConfig {
 	backoff_multiplier: number;
 	price_table?: Record<string, { input_per_1m: number; output_per_1m: number }>;
 	acp_base_url?: string;
+	acp_commands?: Record<
+		string,
+		{ command: string; args?: string[]; env?: Record<string, string> }
+	>;
 	acp_agent_names?: Record<string, string>;
 	// First-run flag: set to true after wizard completes
 	_initialized?: boolean;
