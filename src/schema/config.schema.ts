@@ -19,7 +19,7 @@ export const WorkspaceConfigSchema = z.object({
 	acp_commands: z
 		.record(
 			z.object({
-				command: z.string(),
+				command: z.string().trim().min(1),
 				args: z.array(z.string()).optional(),
 				env: z.record(z.string()).optional(),
 			}),

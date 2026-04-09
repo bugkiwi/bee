@@ -29,9 +29,15 @@ export function getAcpCommandConfig(
 	config?: Pick<WorkspaceConfig, "acp_commands">,
 ): AcpCommandConfig {
 	const override = config?.acp_commands?.[provider];
-	if (override?.command) {
+	if (override) {
+		const command = override.command.trim();
+		if (!command) {
+			throw new Error(
+				`No local ACP command configured for provider "${provider}"`,
+			);
+		}
 		return {
-			command: override.command,
+			command,
 			args: override.args ?? [],
 			env: override.env ?? {},
 		};

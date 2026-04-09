@@ -6,6 +6,7 @@ import {
 } from "../cli/chat.ts";
 import { getAcpCommandConfig } from "../providers/acp/commands.ts";
 import { resolveAcpAgentName } from "../providers/acp/agents.ts";
+import { WorkspaceConfigSchema } from "../schema/config.schema.ts";
 import type { BeeSession } from "../session/manager.ts";
 
 // ─── detectAuthError (copied inline for unit testing) ────────────────────────
@@ -84,6 +85,36 @@ describe("detectAuthError", () => {
 });
 
 describe("ACP chat request", () => {
+	it("parses acp_commands through WorkspaceConfigSchema", () => {
+		const config = WorkspaceConfigSchema.parse({
+			acp_commands: {
+				codex: {
+					command: "codex-acp",
+					args: ["--verbose"],
+					env: { OPENAI_API_KEY: "test" },
+				},
+			},
+		});
+
+		expect(config.acp_commands?.codex).toEqual({
+			command: "codex-acp",
+			args: ["--verbose"],
+			env: { OPENAI_API_KEY: "test" },
+		});
+	});
+
+	it("rejects blank acp_commands commands through WorkspaceConfigSchema", () => {
+		expect(() =>
+			WorkspaceConfigSchema.parse({
+				acp_commands: {
+					codex: {
+						command: "   ",
+					},
+				},
+			}),
+		).toThrow();
+	});
+
 	it("uses built-in stdio ACP defaults for the shipped providers", () => {
 		expect(getAcpCommandConfig("claude")).toEqual({
 			command: "npx",
