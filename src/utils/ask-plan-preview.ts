@@ -14,6 +14,15 @@ import type { AgentTask, AgentTaskStatus } from "../types/task.ts";
 import type { PlanPreviewMeta } from "../types/transcript.ts";
 import { listFiles, readJsonFile } from "./fs.ts";
 
+function annotateTaskOrder(tasks: PlanTask[], nextOrder = { value: 1 }): void {
+	for (const task of tasks) {
+		task.order = nextOrder.value++;
+		if (task.children && task.children.length > 0) {
+			annotateTaskOrder(task.children, nextOrder);
+		}
+	}
+}
+
 export interface AskPlanPreviewLine {
 	type: "assistant";
 	text: string;
@@ -65,9 +74,9 @@ function taskToPlanTask(task: AgentTask): PlanTask {
 		createdAt: task.created_at,
 		updatedAt: task.updated_at,
 		metadata: {
-			expanded: true,
 			acceptanceCriteria: task.acceptance_criteria,
 			testsRequired: task.tests_required,
+			isLinkedTask: true,
 		},
 	};
 }
@@ -87,8 +96,8 @@ function missingTaskToPlanTask(
 		createdAt,
 		updatedAt,
 		metadata: {
-			expanded: true,
 			missing: true,
+			isLinkedTask: true,
 		},
 	};
 }
@@ -111,7 +120,7 @@ async function loadLinkedTasks(
 			detailLines: [`Linked task ${taskId}`],
 			createdAt,
 			updatedAt,
-			metadata: { expanded: true },
+			metadata: { isLinkedTask: true },
 		}));
 	}
 
@@ -185,10 +194,10 @@ function toPlanTask(
 		createdAt,
 		updatedAt,
 		metadata: {
-			expanded: true,
 			acceptanceCriteria: node.acceptance_criteria,
 			leafTaskIds: node.leaf_task_ids,
 			linkedTaskCount: linkedTaskChildren.length,
+			dependsOnTitles: node.depends_on,
 		},
 	};
 }
@@ -197,7 +206,7 @@ export function askPlanToDisplayPlan(
 	plan: AskPlan,
 	linkedTaskIndex: Record<string, PlanTask[]> = {},
 ): Plan {
-	return {
+	const displayPlan: Plan = {
 		id: plan.id,
 		title: plan.goal,
 		description: plan.goal,
@@ -211,6 +220,10 @@ export function askPlanToDisplayPlan(
 			source: "ask-plan",
 		},
 	};
+
+	annotateTaskOrder(displayPlan.tasks);
+
+	return displayPlan;
 }
 
 export async function hydrateAskPlanToDisplayPlan(

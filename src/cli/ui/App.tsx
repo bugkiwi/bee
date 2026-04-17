@@ -76,12 +76,22 @@ import {
 	MAX_HISTORY_ENTRIES,
 	WELCOME_PANEL_ROWS,
 } from "./types.ts";
-import { collectTaskDetailLines } from "../../components/PlanNode.tsx";
+import {
+	buildPlanPresentationModel,
+	buildTopLevelRenderEntries,
+	collectTaskDetailLines,
+	derivePlanTimelineEvents,
+	flattenPlanTasks,
+	type PlanExpansionMode,
+	type PlanTimelineEvent,
+	resolveTaskExpandedState,
+} from "../../components/plan-task-helpers.ts";
 
 const MAX_CONTENT_LINES = 1200;
 const MAX_PLAN_TASK_LOG_LINES = 200;
 const MAX_CAPTURE_TAIL_CHARS = 8192;
 const SCROLLBACK_STEP_LINES = 4;
+const MAX_PLAN_TIMELINE_EVENTS = 6;
 
 export interface InputPlanSummary {
 	planHash: string;
@@ -159,33 +169,57 @@ function buildDisplayPlan(plan: Plan): Plan {
 
 function countInlinePlanPreviewRows(plan: Plan, terminalWidth: number): number {
 	const width = Math.max(20, terminalWidth);
+	const presentation = buildPlanPresentationModel(plan);
+	const renderEntries = buildTopLevelRenderEntries(
+		plan.tasks,
+		presentation.taskStateById,
+	);
 
 	function countTaskRows(task: PlanTask, depth: number): number {
 		let rows = 1;
-		const detailLines = collectTaskDetailLines(task);
-		const visibleDetails =
-			detailLines.length > 0
+		const taskState = presentation.taskStateById[task.id];
+		const detailLines = collectTaskDetailLines(
+			task,
+			undefined,
+			taskState?.active ? 5 : 3,
+		);
+		const shouldExpand = resolveTaskExpandedState(
+			task,
+			depth,
+			taskState,
+			detailLines,
+			true,
+		);
+		const visibleDetails = shouldExpand
+			? detailLines.length > 0
 				? detailLines
-				: depth > 0 && task.description
+				: task.description
 					? [task.description]
-					: [];
+					: []
+			: [];
 		const detailWidth = Math.max(1, width - (8 + depth * 3));
 
 		for (const detailLine of visibleDetails) {
 			rows += rowsForBlock(detailLine, detailWidth);
 		}
 
-		for (const child of task.children ?? []) {
-			rows += countTaskRows(child, depth + 1);
+		if (shouldExpand) {
+			for (const child of task.children ?? []) {
+				rows += countTaskRows(child, depth + 1);
+			}
 		}
 
 		return rows;
 	}
 
-	if (plan.tasks.length === 0) return 3;
+	if (plan.tasks.length === 0) return 4;
 	return (
-		2 +
-		plan.tasks.reduce((total, task) => total + countTaskRows(task, 0), 0)
+		4 +
+		renderEntries.reduce(
+			(total, entry) =>
+				total + (entry.type === "parallel-group" ? 1 : countTaskRows(entry.task, 0)),
+			0,
+		)
 	);
 }
 
@@ -225,10 +259,6 @@ const SNAPSHOT_STATUS_META: Record<
 	running: { icon: "▶", label: "RUNNING" },
 };
 
-function getSnapshotTaskKind(task: PlanTask, depth: number): "plan" | "task" {
-	return task.kind ?? (depth === 0 ? "plan" : "task");
-}
-
 function getSnapshotTreePrefix(
 	ancestorHasNext: boolean[],
 	isLast: boolean,
@@ -245,28 +275,70 @@ function buildPlanSnapshotTaskLines(
 	depth: number,
 	isLast: boolean,
 	ancestorHasNext: boolean[],
+	taskStateById: ReturnType<typeof buildPlanPresentationModel>["taskStateById"],
+	expansionMode: PlanExpansionMode,
+	taskExpansionOverrides?: Record<string, boolean>,
 	taskLogs?: Record<string, string[]>,
 ): string[] {
-	const kind = getSnapshotTaskKind(task, depth);
 	const children = task.children ?? [];
-	const marker = children.length > 0 ? "▾" : "▸";
-	const status = SNAPSHOT_STATUS_META[task.status];
+	const taskState = taskStateById[task.id];
+	const blocked = taskState?.blocked === true;
+	const status = blocked
+		? { icon: "□", label: "BLOCKED" }
+		: SNAPSHOT_STATUS_META[task.status];
+	const marker =
+		children.length > 0 && taskState?.activePath ? "▾" : children.length > 0 ? "▸" : "•";
+	const suffix = blocked
+		? ` › blocked by ${taskState.blockedByOrders
+				.map((order) => `#${order}`)
+				.join(", ")}`
+		: task.status === PlanStatus.running
+			? " › in progress"
+			: task.status === PlanStatus.pending
+				? " › ready"
+				: task.status === PlanStatus.paused
+					? " › needs verification"
+					: task.status === PlanStatus.failed
+						? " › needs fix"
+						: "";
 	const lines = [
-		`${getSnapshotTreePrefix(ancestorHasNext, isLast, marker)}[ ${kind.toUpperCase()} ] ${task.title} [ ${status.icon} ${status.label} ]`,
+		`${getSnapshotTreePrefix(ancestorHasNext, isLast, marker)}${status.icon} #${
+			taskState?.order ?? depth + 1
+		} ${task.title}${suffix}`,
 	];
 	const detailPrefix =
 		ancestorHasNext.map((hasNext) => (hasNext ? "│  " : "   ")).join("") +
 		`${isLast ? "   " : "│  "}   `;
-	for (const detail of collectTaskDetailLines(task, taskLogs)) {
-		lines.push(`${detailPrefix}✓ ${detail}`);
+	const detailLines = collectTaskDetailLines(
+		task,
+		taskLogs,
+		taskState?.active ? 5 : 3,
+	);
+	const shouldExpand = resolveTaskExpandedState(
+		task,
+		depth,
+		taskState,
+		detailLines,
+		true,
+		expansionMode,
+		taskExpansionOverrides?.[task.id],
+	);
+	if (shouldExpand && detailLines.length === 0 && task.description) {
+		detailLines.push(task.description);
 	}
-	for (const [index, child] of children.entries()) {
+	for (const detail of shouldExpand ? detailLines : []) {
+		lines.push(`${detailPrefix}↳ ${detail}`);
+	}
+	for (const [index, child] of shouldExpand ? children.entries() : []) {
 		lines.push(
 			...buildPlanSnapshotTaskLines(
 				child,
 				depth + 1,
 				index === children.length - 1,
 				[...ancestorHasNext, !isLast],
+				taskStateById,
+				expansionMode,
+				taskExpansionOverrides,
 				taskLogs,
 			),
 		);
@@ -276,22 +348,72 @@ function buildPlanSnapshotTaskLines(
 
 export function buildPlanSnapshotLines(
 	plan: Plan,
+	expansionMode: PlanExpansionMode = "auto",
+	taskExpansionOverrides?: Record<string, boolean>,
+	timelineEvents: PlanTimelineEvent[] = [],
 	taskLogs?: Record<string, string[]>,
 ): string[] {
+	const presentation = buildPlanPresentationModel(plan);
+	const renderEntries = buildTopLevelRenderEntries(
+		plan.tasks,
+		presentation.taskStateById,
+	);
 	const status = SNAPSHOT_STATUS_META[plan.status];
-	const lines = [`◇ ${plan.title} [ ${status.icon} ${status.label} ]`];
-	lines.push("─".repeat(32));
+	const lines = [
+		`${status.icon} ${plan.title}`,
+		`${presentation.rootSummary.completed}/${presentation.rootSummary.total} done${
+			presentation.rootSummary.running > 0
+				? ` · ${presentation.rootSummary.running} active`
+				: ""
+		}${
+			presentation.rootSummary.blocked > 0
+				? ` · ${presentation.rootSummary.blocked} blocked`
+				: ""
+		}${
+			presentation.rootSummary.ready > 0
+				? ` · ${presentation.rootSummary.ready} ready`
+				: ""
+		}`,
+		"Task List",
+	];
+	lines.push("Ctrl+O toggle focus · Ctrl+Shift+O toggle all");
+	if (timelineEvents.length > 0) {
+		lines.splice(3, 0, "Execution Flow", ...timelineEvents.map((event) => {
+			const prefix =
+				event.tone === "success"
+					? "✓"
+					: event.tone === "error"
+						? "×"
+						: event.tone === "warning"
+							? "◆"
+							: "→";
+			return `${prefix} ${event.text}`;
+		}));
+	}
 	if (plan.tasks.length === 0) {
-		lines.push("No plan nodes yet.");
+		lines.push("Waiting for planner nodes or live task hydration.");
 		return lines;
 	}
-	for (const [index, task] of plan.tasks.entries()) {
+	const taskEntryIds = renderEntries
+		.filter(
+			(entry): entry is Extract<(typeof renderEntries)[number], { type: "task" }> =>
+				entry.type === "task",
+		)
+		.map((entry) => entry.task.id);
+	for (const entry of renderEntries) {
+		if (entry.type === "parallel-group") {
+			lines.push(entry.label);
+			continue;
+		}
 		lines.push(
 			...buildPlanSnapshotTaskLines(
-				task,
+				entry.task,
 				0,
-				index === plan.tasks.length - 1,
+				entry.task.id === taskEntryIds[taskEntryIds.length - 1],
 				[],
+				presentation.taskStateById,
+				expansionMode,
+				taskExpansionOverrides,
 				taskLogs,
 			),
 		);
@@ -325,6 +447,9 @@ export function buildScrollbackSnapshotLines(
 	options: {
 		displayPlan: Plan | null;
 		planTaskLogs: Record<string, string[]>;
+		planExpansionMode?: PlanExpansionMode;
+		planTaskExpansionOverrides?: Record<string, boolean>;
+		planTimelineEvents?: PlanTimelineEvent[];
 		expandedThinkingIds: Set<string>;
 		isProcessing: boolean;
 		streamingMetaGroupId: string | null;
@@ -353,7 +478,15 @@ export function buildScrollbackSnapshotLines(
 		}
 	}
 	if (options.displayPlan) {
-		lines.push(...buildPlanSnapshotLines(options.displayPlan, options.planTaskLogs));
+		lines.push(
+			...buildPlanSnapshotLines(
+				options.displayPlan,
+				options.planExpansionMode,
+				options.planTaskExpansionOverrides,
+				options.planTimelineEvents,
+				options.planTaskLogs,
+			),
+		);
 	}
 	return lines.map((line) => line.trimEnd());
 }
@@ -514,30 +647,9 @@ export function extractScrollbackSnapshotLines(snapshot: string): string[] {
 	return lines;
 }
 
-function flattenPlanTasks(tasks: PlanTask[]): PlanTask[] {
-	const flat: PlanTask[] = [];
-
-	for (const task of tasks) {
-		flat.push(task);
-		if (task.children && task.children.length > 0) {
-			flat.push(...flattenPlanTasks(task.children));
-		}
-	}
-
-	return flat;
-}
-
 function getActiveDisplayTaskId(plan: Plan | null): string | null {
 	if (!plan || plan.tasks.length === 0) return null;
-	const flatTasks = flattenPlanTasks(plan.tasks);
-	const running = flatTasks.find((task) => task.status === PlanStatus.running);
-	if (running) return running.id;
-	const nextUp = flatTasks.find(
-		(task) =>
-			task.status === PlanStatus.pending || task.status === PlanStatus.paused,
-	);
-	if (nextUp) return nextUp.id;
-	return flatTasks.at(-1)?.id ?? null;
+	return buildPlanPresentationModel(plan).activeTaskId;
 }
 
 export function formatPlanSummaryHash(planId: string): string {
@@ -550,6 +662,7 @@ export function formatPlanSummaryHash(planId: string): string {
 export function buildInputPlanSummary(plan: Plan | null): InputPlanSummary | null {
 	if (!plan) return null;
 
+	const presentation = buildPlanPresentationModel(plan);
 	const flatTasks = flattenPlanTasks(plan.tasks);
 	if (flatTasks.length === 0) {
 		return {
@@ -560,7 +673,7 @@ export function buildInputPlanSummary(plan: Plan | null): InputPlanSummary | nul
 		};
 	}
 
-	const activeTaskId = getActiveDisplayTaskId(plan);
+	const activeTaskId = presentation.activeTaskId;
 	const activeTaskIndex = Math.max(
 		0,
 		flatTasks.findIndex((task) => task.id === activeTaskId),
@@ -679,6 +792,18 @@ export function App({
 	const [planTaskLogs, setPlanTaskLogs] = useState<Record<string, string[]>>(
 		{},
 	);
+	const [planTimelineEvents, setPlanTimelineEvents] = useState<
+		PlanTimelineEvent[]
+	>([]);
+	const [planExpansionMode, setPlanExpansionMode] =
+		useState<PlanExpansionMode>("auto");
+	const [planTaskExpansionOverrides, setPlanTaskExpansionOverrides] = useState<
+		Record<string, boolean>
+	>({});
+	const displayPlanPresentation = useMemo(
+		() => (displayPlan ? buildPlanPresentationModel(displayPlan) : null),
+		[displayPlan],
+	);
 	const activeDisplayTaskId = useMemo(
 		() => getActiveDisplayTaskId(displayPlan),
 		[displayPlan],
@@ -698,18 +823,27 @@ export function App({
 	const lastLineId = useMemo(() => lines.at(-1)?.id ?? null, [lines]);
 	const processedPlanLineIdRef = useRef<string | null>(null);
 	const activePlanIdRef = useRef<string | null>(null);
+	const previousDisplayPlanRef = useRef<Plan | null>(null);
 
 	useEffect(() => {
 		if (!displayPlan) {
 			activePlanIdRef.current = null;
 			processedPlanLineIdRef.current = lastLineId;
 			setPlanTaskLogs({});
+			setPlanTaskExpansionOverrides({});
+			setPlanExpansionMode("auto");
+			setPlanTimelineEvents([]);
+			previousDisplayPlanRef.current = null;
 			return;
 		}
 
 		if (activePlanIdRef.current !== displayPlan.id) {
 			activePlanIdRef.current = displayPlan.id;
 			processedPlanLineIdRef.current = lastLineId;
+			setPlanTaskExpansionOverrides({});
+			setPlanExpansionMode("auto");
+			setPlanTimelineEvents([]);
+			previousDisplayPlanRef.current = displayPlan;
 			const flatTasks = flattenPlanTasks(displayPlan.tasks);
 			setPlanTaskLogs(
 				Object.fromEntries(flatTasks.map((task) => [task.id, []])),
@@ -725,7 +859,29 @@ export function App({
 				]),
 			),
 		);
+		setPlanTaskExpansionOverrides((prev) =>
+			Object.fromEntries(
+				flattenPlanTasks(displayPlan.tasks)
+					.filter((task) => task.id in prev)
+					.map((task) => [task.id, prev[task.id] as boolean]),
+			),
+		);
 	}, [displayPlan, lastLineId]);
+
+	useEffect(() => {
+		if (!displayPlan) return;
+
+		const derived = derivePlanTimelineEvents(
+			previousDisplayPlanRef.current,
+			displayPlan,
+		);
+		if (derived.length > 0) {
+			setPlanTimelineEvents((prev) =>
+				appendCappedLines(prev, derived, MAX_PLAN_TIMELINE_EVENTS),
+			);
+		}
+		previousDisplayPlanRef.current = displayPlan;
+	}, [displayPlan]);
 
 	useEffect(() => {
 		if (!displayPlan || !activeDisplayTaskId) {
@@ -970,6 +1126,46 @@ export function App({
 			else next.add(groupId);
 			return next;
 		});
+	}, []);
+
+	const toggleFocusedPlanBranch = useCallback(() => {
+		if (!displayPlan || !displayPlanPresentation) return;
+		const targetTaskId = displayPlanPresentation.activeTaskId;
+		if (!targetTaskId) return;
+		const targetTask = flattenPlanTasks(displayPlan.tasks).find(
+			(task) => task.id === targetTaskId,
+		);
+		if (!targetTask) return;
+		const detailLines = collectTaskDetailLines(
+			targetTask,
+			planTaskLogs,
+			targetTaskId === displayPlanPresentation.activeTaskId ? 5 : 3,
+		);
+		const expanded = resolveTaskExpandedState(
+			targetTask,
+			0,
+			displayPlanPresentation.taskStateById[targetTask.id],
+			detailLines,
+			true,
+			planExpansionMode,
+			planTaskExpansionOverrides[targetTask.id],
+		);
+		setPlanTaskExpansionOverrides((prev) => ({
+			...prev,
+			[targetTaskId]: !expanded,
+		}));
+	}, [
+		displayPlan,
+		displayPlanPresentation,
+		planExpansionMode,
+		planTaskExpansionOverrides,
+		planTaskLogs,
+	]);
+
+	const toggleAllPlanBranches = useCallback(() => {
+		setPlanExpansionMode((prev) =>
+			prev === "all" ? "collapsed" : prev === "collapsed" ? "auto" : "all",
+		);
 	}, []);
 
 	useEffect(() => {
@@ -1851,6 +2047,26 @@ export function App({
 		}
 	});
 
+	useInput((_ch, key) => {
+		if (
+			isExiting ||
+			providerPicker ||
+			slashQuickOptionsVisible ||
+			scrollbackOffset > 0 ||
+			!displayPlan
+		) {
+			return;
+		}
+
+		if (key.ctrl && (_ch === "o" || _ch === "O")) {
+			if (key.shift) {
+				toggleAllPlanBranches();
+				return;
+			}
+			toggleFocusedPlanBranch();
+		}
+	});
+
 	// ── History navigation ─────────────────────────────────────────────────────
 
 	useInput((_ch, key) => {
@@ -2040,6 +2256,9 @@ export function App({
 		return buildScrollbackSnapshotLines(renderItems, {
 			displayPlan: displayPlan && !isExiting ? displayPlan : null,
 			planTaskLogs,
+			planExpansionMode,
+			planTaskExpansionOverrides,
+			planTimelineEvents,
 			expandedThinkingIds,
 			isProcessing,
 			streamingMetaGroupId,
@@ -2049,6 +2268,9 @@ export function App({
 		expandedThinkingIds,
 		isExiting,
 		isProcessing,
+		planExpansionMode,
+		planTaskExpansionOverrides,
+		planTimelineEvents,
 		planTaskLogs,
 		renderItems,
 		streamingMetaGroupId,
@@ -2128,6 +2350,9 @@ export function App({
 								plans={displayPlan ? [displayPlan] : []}
 								taskLogs={planTaskLogs}
 								terminalWidth={Math.max(20, stdout.columns ?? 80)}
+								expansionMode={planExpansionMode}
+								taskExpansionOverrides={planTaskExpansionOverrides}
+								timelineEvents={planTimelineEvents}
 							/>
 						</Box>
 					</Box>
@@ -2167,6 +2392,9 @@ export function App({
 								plans={[displayPlan]}
 								taskLogs={planTaskLogs}
 								terminalWidth={Math.max(20, stdout.columns ?? 80)}
+								expansionMode={planExpansionMode}
+								taskExpansionOverrides={planTaskExpansionOverrides}
+								timelineEvents={planTimelineEvents}
 							/>
 						</Box>
 						) : null}

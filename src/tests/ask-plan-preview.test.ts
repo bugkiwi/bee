@@ -37,6 +37,7 @@ function makeAskPlan(): AskPlan {
 				acceptance_criteria: [
 					"Scrolling no longer exits the process",
 				],
+				depends_on: ["Reproduce & diagnose"],
 				depth: 0,
 				status: "pending",
 				sub_nodes: [
@@ -82,9 +83,13 @@ describe("ask plan preview", () => {
 		expect(plan.tasks).toHaveLength(2);
 		expect(plan.tasks[0]?.status).toBe("failed");
 		expect(plan.tasks[1]?.kind).toBe("plan");
+		expect(plan.tasks[1]?.metadata?.dependsOnTitles).toEqual([
+			"Reproduce & diagnose",
+		]);
 		expect(plan.tasks[1]?.children?.[0]?.status).toBe("completed");
 		expect(plan.tasks[1]?.children?.[1]?.title).toBe("Clamp scrollback offset");
-		expect(plan.tasks[1]?.metadata?.expanded).toBe(true);
+		expect(plan.tasks[0]?.order).toBe(1);
+		expect(plan.tasks[1]?.order).toBe(2);
 	});
 
 	it("creates plan preview meta that stays out of collapsible tool groups", () => {
@@ -119,7 +124,9 @@ describe("ask plan preview", () => {
 		expect(text).toContain(
 			"Fix bee TUI: scrolling conversation history causes process to exit",
 		);
+		expect(text).toContain("Task List");
 		expect(text).toContain("Reproduce & diagnose");
+		expect(text).toContain("blocked by #1");
 		expect(text).toContain("Set up a reliable reproduction case");
 		expect(text).toContain("Clamp offsets");
 		expect(text).toContain("Clamp scrollback offset");

@@ -10,9 +10,9 @@ import { StdioAcpClient } from "../providers/acp/stdio-client.ts";
 import type { BeeSession, BeeTranscriptLine } from "../session/manager.ts";
 import { SessionManager } from "../session/manager.ts";
 import {
+	type WorkspaceConfig,
 	normalizeProviderName,
 	normalizeWorkspaceConfig,
-	type WorkspaceConfig,
 } from "../types/config.ts";
 import type { ToolDiffMeta } from "../types/transcript.ts";
 import { createToolDiffPreview } from "../utils/diff-preview.ts";
@@ -802,101 +802,96 @@ export class ChatSession {
 		};
 
 		try {
-			client = new StdioAcpClient(
-				getAcpCommandConfig(provider, this.config),
-				{
-					cwd,
-					onNotification: (message: AcpJsonRpcNotification) => {
-						if (message.method !== "session/update") return;
-						const params = asRecord(message.params);
-						const update = asRecord(params?.update) as AcpSessionUpdate | null;
-						if (!update?.sessionUpdate) return;
+			client = new StdioAcpClient(getAcpCommandConfig(provider, this.config), {
+				cwd,
+				onNotification: (message: AcpJsonRpcNotification) => {
+					if (message.method !== "session/update") return;
+					const params = asRecord(message.params);
+					const update = asRecord(params?.update) as AcpSessionUpdate | null;
+					if (!update?.sessionUpdate) return;
 
-						switch (update.sessionUpdate) {
-							case "agent_message_chunk": {
-								const text = extractAcpUpdateText(update.content);
-								if (!text) return;
-								stopOnce();
-								fullText += text;
-								if (initialTextState === "plan") {
-									return;
-								}
-
-								if (initialTextState === "text") {
-									emitText(text);
-									return;
-								}
-
-								initialTextBuffer += text;
-								const classification = classifyInitialPlanMarker(
-									initialTextBuffer,
-								);
-								if (classification.kind === "pending") {
-									return;
-								}
-
-								if (classification.kind === "plan") {
-									initialTextState = "plan";
-									planGoal = classification.goal ?? null;
-									return;
-								}
-
-								initialTextState = "text";
-								emitText(initialTextBuffer);
-								initialTextBuffer = "";
+					switch (update.sessionUpdate) {
+						case "agent_message_chunk": {
+							const text = extractAcpUpdateText(update.content);
+							if (!text) return;
+							stopOnce();
+							fullText += text;
+							if (initialTextState === "plan") {
 								return;
 							}
-							case "agent_thought_chunk": {
-								const excerpt = extractAcpUpdateText(update.content).trim();
-								if (!excerpt) return;
-								stopOnce();
-								if (eventMode) {
-									hooks?.onThinking?.(excerpt);
-								} else {
-									tracker.beforeText();
-									process.stdout.write(
-										chalk.dim(`\n  💭  ${excerpt}\n`),
-									);
-								}
+
+							if (initialTextState === "text") {
+								emitText(text);
 								return;
 							}
-							case "tool_call": {
-								stopOnce();
-								const { name, preview } = parseAcpToolTitle(
-									update.title ?? "tool",
-								);
-								tracker.trackPreview(name, preview);
+
+							initialTextBuffer += text;
+							const classification =
+								classifyInitialPlanMarker(initialTextBuffer);
+							if (classification.kind === "pending") {
 								return;
 							}
+
+							if (classification.kind === "plan") {
+								initialTextState = "plan";
+								planGoal = classification.goal ?? null;
+								return;
+							}
+
+							initialTextState = "text";
+							emitText(initialTextBuffer);
+							initialTextBuffer = "";
+							return;
 						}
-					},
-					onRequest: (message: AcpJsonRpcRequest) => {
-						if (message.method !== "session/request_permission") {
-							throw new Error(`Unsupported ACP request: ${message.method}`);
+						case "agent_thought_chunk": {
+							const excerpt = extractAcpUpdateText(update.content).trim();
+							if (!excerpt) return;
+							stopOnce();
+							if (eventMode) {
+								hooks?.onThinking?.(excerpt);
+							} else {
+								tracker.beforeText();
+								process.stdout.write(chalk.dim(`\n  💭  ${excerpt}\n`));
+							}
+							return;
 						}
-
-						const params = asRecord(message.params);
-						const rawOptions = Array.isArray(params?.options)
-							? params.options
-							: [];
-						const options = rawOptions
-							.map((option) => asRecord(option))
-							.filter((option): option is Record<string, unknown> => option !== null)
-							.map((option) => ({
-								kind:
-									typeof option.kind === "string" ? option.kind : undefined,
-								optionId:
-									typeof option.optionId === "string"
-										? option.optionId
-										: undefined,
-							}));
-						const optionId = pickAcpPermissionOptionId(options);
-						return optionId
-							? { outcome: { outcome: "selected", optionId } }
-							: { outcome: { outcome: "cancelled" } };
-					},
+						case "tool_call": {
+							stopOnce();
+							const { name, preview } = parseAcpToolTitle(
+								update.title ?? "tool",
+							);
+							tracker.trackPreview(name, preview);
+							return;
+						}
+					}
 				},
-			);
+				onRequest: (message: AcpJsonRpcRequest) => {
+					if (message.method !== "session/request_permission") {
+						throw new Error(`Unsupported ACP request: ${message.method}`);
+					}
+
+					const params = asRecord(message.params);
+					const rawOptions = Array.isArray(params?.options)
+						? params.options
+						: [];
+					const options = rawOptions
+						.map((option) => asRecord(option))
+						.filter(
+							(option): option is Record<string, unknown> => option !== null,
+						)
+						.map((option) => ({
+							kind: typeof option.kind === "string" ? option.kind : undefined,
+							optionId:
+								typeof option.optionId === "string"
+									? option.optionId
+									: undefined,
+						}));
+					const optionId = pickAcpPermissionOptionId(options);
+					return optionId
+						? { outcome: { outcome: "selected", optionId } }
+						: { outcome: { outcome: "cancelled" } };
+				},
+			});
 			await client.connect();
 
 			const previousSessionId = this.getProviderSessionId(provider);
@@ -912,7 +907,9 @@ export class ChatSession {
 			const sessionId =
 				extractSessionId(sessionResult) ?? previousSessionId ?? null;
 			if (!sessionId) {
-				throw new Error(`ACP session did not return a session id for "${provider}"`);
+				throw new Error(
+					`ACP session did not return a session id for "${provider}"`,
+				);
 			}
 			await this.bindProviderSessionId(provider, sessionId);
 
@@ -1191,6 +1188,7 @@ export class ChatSession {
 		}
 
 		const proc = Bun.spawn(args, {
+			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
 		});

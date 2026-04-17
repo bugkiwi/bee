@@ -38,7 +38,7 @@ export const DEFAULT_CONFIG: WorkspaceConfig = {
 		"claude-sonnet-4-6": { input_per_1m: 3.0, output_per_1m: 15.0 },
 		"claude-opus-4-6": { input_per_1m: 15.0, output_per_1m: 75.0 },
 		"claude-haiku-4-5-20251001": { input_per_1m: 0.8, output_per_1m: 4.0 },
-		"codex-mini-latest": { input_per_1m: 1.5, output_per_1m: 6.0 },
+		"gpt-5.4": { input_per_1m: 1.5, output_per_1m: 6.0 },
 	},
 };
 

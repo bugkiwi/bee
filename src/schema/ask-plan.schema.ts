@@ -8,6 +8,7 @@ const AskPlanNodeSchemaBase = z.object({
   title: z.string(),
   description: z.string(),
   acceptance_criteria: z.array(z.string()),
+  depends_on: z.array(z.string()).optional(),
   depth: z.number().int().min(0),
   status: AskPlanNodeStatusSchema,
   leaf_task_ids: z.array(z.string()).optional(),

@@ -213,30 +213,6 @@ Every execution emits:
 
 ---
 
-## Project Structure
-
-```
-bee/
-├── src/
-│   ├── cli/          # REPL, Ink UI components, commands
-│   │   └── ui/       # App.tsx, content rendering, types
-│   ├── agent/        # Agent loop
-│   ├── providers/    # Claude, Codex, Kimi adapters
-│   ├── plugins/      # Plugin registry and built-ins
-│   ├── tasks/        # Task contract engine
-│   ├── state/        # State machine + persistence
-│   ├── session/      # Session store and provider bindings
-│   ├── verifier/     # Verification gate
-│   ├── observability/# Tracing, cost, logs
-│   ├── types/        # Shared type definitions
-│   ├── utils/        # Diff preview, helpers
-│   ├── tests/        # Test suite
-│   └── schema/       # Zod schemas
-└── .bee/             # Local runtime data, config, tasks, state, logs
-```
-
----
-
 ## Development
 
 ```bash

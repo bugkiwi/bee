@@ -482,6 +482,10 @@ describe("App scrollback helpers", () => {
 			{
 				displayPlan: plan,
 				planTaskLogs: { "task-1": ["latest breadcrumb captured"] },
+				planTimelineEvents: [
+					{ tone: "info", text: "Starting #1" },
+					{ tone: "success", text: "#0 complete" },
+				],
 				expandedThinkingIds: new Set<string>(),
 				isProcessing: false,
 				streamingMetaGroupId: null,
@@ -490,8 +494,10 @@ describe("App scrollback helpers", () => {
 
 		expect(lines).toContain("› hello");
 		expect(lines).toContain("▶ [tracing root cause]");
-		expect(lines).toContain("◇ Execution Plan [ ▶ RUNNING ]");
-		expect(lines).toContain("└─ ▸ [ PLAN ] Investigate crash [ ▶ RUNNING ]");
+		expect(lines).toContain("▶ Execution Plan");
+		expect(lines).toContain("Execution Flow");
+		expect(lines).toContain("→ Starting #1");
+		expect(lines).toContain("└─ • ▶ #1 Investigate crash › in progress");
 	});
 
 	it("matches input panel height for picker and slash-option states", () => {

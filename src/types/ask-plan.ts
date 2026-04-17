@@ -12,6 +12,7 @@ export interface AskPlanNode {
   title: string;
   description: string;
   acceptance_criteria: string[];
+  depends_on?: string[];
   depth: number; // 0 = root level, increments with recursion
   status: AskPlanNodeStatus;
   /** Set when this node is further decomposed into sub-nodes */
